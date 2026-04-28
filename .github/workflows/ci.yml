@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-flight runs on the same branch when a new commit is pushed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Release]
+        include:
+          # Linux also runs Debug to catch UB / sanitiser issues earlier.
+          - os: ubuntu-latest
+            build_type: Debug
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      # mass-proto sibling repo — checked out next to mass-worker-llama-cpp
+      # via the second actions/checkout step below.
+      MASS_PROTO_DIR: ${{ github.workspace }}/mass-proto
+
+    steps:
+      - name: Checkout mass-worker-llama-cpp
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: mass-worker-llama-cpp
+
+      - name: Checkout mass-proto (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: chinese-room-solutions/mass-proto
+          path: mass-proto
+
+      - name: Set up vcpkg cache (GitHub Actions)
+        # Lets vcpkg reuse compiled binaries across CI runs via the gha cache.
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build pkg-config autoconf automake libtool curl zip unzip tar
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: brew install ninja autoconf automake libtool
+
+      - name: Install Windows build deps
+        if: runner.os == 'Windows'
+        run: choco install -y ninja
+
+      - name: Bootstrap vcpkg
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          else
+            "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Configure
+        working-directory: mass-worker-llama-cpp
+        shell: bash
+        run: |
+          cmake -B build -S . \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DMASS_PROTO_DIR="$MASS_PROTO_DIR" \
+            -DMASS_WORKER_WERROR=ON
+
+      - name: Build
+        working-directory: mass-worker-llama-cpp
+        run: cmake --build build -j
+
+      - name: Test
+        working-directory: mass-worker-llama-cpp
+        run: ctest --test-dir build --output-on-failure -j
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.os }}-${{ matrix.build_type }}
+          path: |
+            mass-worker-llama-cpp/build/CMakeFiles/CMakeOutput.log
+            mass-worker-llama-cpp/build/CMakeFiles/CMakeError.log
+            mass-worker-llama-cpp/build/vcpkg-manifest-install.log
+          if-no-files-found: ignore

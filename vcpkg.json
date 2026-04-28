@@ -1,0 +1,19 @@
+{
+  "name": "mass-worker-llama-cpp",
+  "version-string": "0.1.0",
+  "description": "MASS worker — llama.cpp inference runtime, native C++ implementation",
+  "homepage": "https://github.com/chinese-room-solutions/mass-worker-llama-cpp",
+  "dependencies": [
+    "grpc",
+    "protobuf",
+    "spdlog",
+    "cli11",
+    "gtest",
+    {
+      "name": "curl",
+      "default-features": false,
+      "features": ["ssl"]
+    },
+    "openssl"
+  ]
+}
