@@ -141,7 +141,7 @@ TEST(FetcherTest, LoopbackPathReusedInPlace) {
     std::atomic<bool> cancel{false};
     auto r = fetcher.fetch_all({f}, cancel);
     ASSERT_TRUE(r) << (r ? "" : r.error().message);
-    EXPECT_EQ((*r)[1], loopback);
+    EXPECT_EQ((*r)[0], loopback);
 }
 
 TEST(FetcherTest, LoopbackMissingFileFails) {
@@ -172,7 +172,7 @@ TEST(FetcherTest, ExistingCachedFileReusedWhenShaMatches) {
     std::atomic<bool> cancel{false};
     auto r = fetcher.fetch_all({f}, cancel);
     ASSERT_TRUE(r);
-    EXPECT_EQ((*r)[1], cached);
+    EXPECT_EQ((*r)[0], cached);
 }
 
 TEST(FetcherTest, MissingFileNoUrlIsError) {
@@ -196,7 +196,7 @@ TEST(FetcherTest, NoPrimaryRoleIsError) {
     mass_worker::Fetcher fetcher(td.path() / "cache");
     mass_worker::ModelFile f{
         .local_path = loopback.string(),
-        .role = 2,  // PROJECTOR — no PRIMARY in request
+        .role = 2,  // MMPROJ — no PRIMARY in request
     };
     std::atomic<bool> cancel{false};
     auto r = fetcher.fetch_all({f}, cancel);

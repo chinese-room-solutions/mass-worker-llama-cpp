@@ -6,8 +6,15 @@ Apply them throughout this codebase.
 ## Core principles
 - Best modern C++ practices (C++20). Simple, reusable, maintainable code.
 - Optimize where it pays off, but maintainability and simplicity come first.
-- Don't add abstractions that aren't earning their keep. Three similar lines is
-  better than a premature template.
+- Use proper abstraction only where truly required. Abstractions belong at
+  the seams (subsystem boundaries, RPC edges, RAII wrappers around C APIs)
+  — not mid-code. Three similar lines is better than a premature template.
+- Avoid over-generalizing for hypothetical future use — write the minimal
+  thing first. Add the template / virtual base / policy class when a
+  second concrete need actually shows up.
+- Design for reversibility: keep features self-contained and don't leak
+  concerns across boundaries. Ask "what would it take to delete this?"
+  before committing something.
 - Breaking changes are fine when they make the code better.
 - After making changes, revisit them: simpler? something now unused? remove it.
 
@@ -34,6 +41,12 @@ Apply them throughout this codebase.
   - returns/propagates the error to a caller that can act on it, OR
   - logs at the call site with the full context (subsystem fields + error code), OR
   - aborts via `std::terminate` for invariant violations that should never happen.
+- Don't `(void)expr` away a `[[nodiscard]]` result, and don't ignore an
+  `std::expected` by destructuring only the value. Either handle the
+  error, propagate it up, or log it — same rule as the parent project's
+  Go "never `_ =` an error". The narrow exemption is genuinely
+  fire-and-forget calls in shutdown paths where there is nothing the
+  caller could do with the failure; even then, prefer a one-line log.
 - Exceptions are reserved for unrecoverable invariants (out-of-memory, broken
   protobuf state). Don't throw across API boundaries; return `std::expected` instead.
 - Prefer fail-fast on programmer errors (assertions, contract violations) over

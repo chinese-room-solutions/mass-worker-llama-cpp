@@ -80,7 +80,7 @@ endif()
 include(cmake/Proto.cmake)
 mass_generate_proto(
     PROTO_DIR "${MASS_PROTO_DIR}/proto"
-    PROTOS    service.proto worker/worker.proto
+    PROTOS    service.proto worker/worker.proto llama-cpp/payload.proto
     OUT_DIR   "${CMAKE_BINARY_DIR}/proto"
     OUT_VAR   MASS_PROTO_SOURCES
 )

@@ -4,10 +4,14 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include "ggml-backend.h"
 
 #include "mass_worker/llama_handles.hpp"
 
@@ -37,6 +41,12 @@ struct ChatModelLoadConfig {
     std::string cache_type;                   // "" / "f16" / "q8_0" / "q4_0"
     std::string chat_template;                // optional override
     bool thinking{false};                     // reasoning mode
+
+    // Operator-controlled device whitelist. Empty = use every backend
+    // llama.cpp enumerates (default). When non-empty, becomes the
+    // null-terminated mparams.devices array — llama.cpp restricts layer
+    // placement to these backends.
+    std::vector<ggml_backend_dev_t> allowed_devices;
 };
 
 // Errors from the model layer.
@@ -137,6 +147,22 @@ public:
     [[nodiscard]] std::expected<CompletionResult, ModelError>
     chat_completion(const std::vector<ChatMessage>& messages,
                     const SamplingParams&           sampling);
+
+    // OnTokenFn is invoked once per generated token with the token's text
+    // piece. Empty pieces (typical after BPE space normalization) and
+    // pieces consumed by stop-sequence detection are still delivered for
+    // streaming continuity. Return value is ignored.
+    using OnTokenFn = std::function<void(std::string_view piece)>;
+
+    // chat_completion_stream is the streaming variant: same final result,
+    // but on_token fires once per generated piece during inference. The
+    // returned CompletionResult carries usage + finish_reason exactly as
+    // the non-streaming variant — text is the full assistant message
+    // (post thinking-strip when enabled).
+    [[nodiscard]] std::expected<CompletionResult, ModelError>
+    chat_completion_stream(const std::vector<ChatMessage>& messages,
+                           const SamplingParams&           sampling,
+                           OnTokenFn                       on_token);
 
     [[nodiscard]] std::vector<std::filesystem::path> backing_paths() const;
     [[nodiscard]] const ChatModelLoadConfig& config() const { return cfg_; }

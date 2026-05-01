@@ -19,8 +19,9 @@ struct RunnerConfig {
     std::string models_dir;     // local cache root
     std::string log_level;      // spdlog level name
 
-    // How often to send WorkerHeartbeat. Matches Go runner's 10s tick.
-    std::chrono::milliseconds heartbeat_interval{std::chrono::seconds{10}};
+    // How often to send WorkerHeartbeat. Drives MASS-side gauge refresh
+    // cadence in the Workers tab; 2s keeps utilization rings smooth.
+    std::chrono::milliseconds heartbeat_interval{std::chrono::seconds{2}};
     // Backoff between reconnection attempts.
     std::chrono::milliseconds reconnect_backoff{std::chrono::seconds{1}};
 };

@@ -23,6 +23,9 @@ struct EmbeddingModelLoadConfig {
     int32_t max_concurrent{1};    // pool size: number of contexts
     std::string main_gpu;
     std::vector<float> tensor_split;
+
+    // Operator-controlled device whitelist (see ChatModelLoadConfig).
+    std::vector<ggml_backend_dev_t> allowed_devices;
 };
 
 struct EmbedPoolSlot;

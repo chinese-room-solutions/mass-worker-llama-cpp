@@ -115,9 +115,20 @@ std::expected<void, ModelError> ChatModel::initialize() {
         mparams.tensor_split = cfg_.tensor_split.data();
     }
 
-    spdlog::info("loading model path={} gpu_layers={} ctx={} batch={} threads={}",
+    // Operator-controlled device whitelist. llama.cpp expects a null-
+    // terminated array; rebuild on the local stack so the storage outlives
+    // the load call.
+    std::vector<ggml_backend_dev_t> allowed_with_sentinel;
+    if (!cfg_.allowed_devices.empty()) {
+        allowed_with_sentinel = cfg_.allowed_devices;
+        allowed_with_sentinel.push_back(nullptr);
+        mparams.devices = allowed_with_sentinel.data();
+    }
+
+    spdlog::info("loading model path={} gpu_layers={} ctx={} batch={} threads={} allowed_devices={}",
                  cfg_.path.string(), mparams.n_gpu_layers, context_size,
-                 batch_size, threads);
+                 batch_size, threads,
+                 cfg_.allowed_devices.empty() ? "<all>" : std::to_string(cfg_.allowed_devices.size()));
 
     LlamaModelPtr model(llama_model_load_from_file(cfg_.path.string().c_str(), mparams));
     if (!model) {
@@ -463,6 +474,13 @@ struct PoolSlot {
 std::expected<CompletionResult, ModelError>
 ChatModel::chat_completion(const std::vector<ChatMessage>& messages,
                            const SamplingParams&           sampling) {
+    return chat_completion_stream(messages, sampling, /*on_token=*/{});
+}
+
+std::expected<CompletionResult, ModelError>
+ChatModel::chat_completion_stream(const std::vector<ChatMessage>& messages,
+                                  const SamplingParams&           sampling,
+                                  OnTokenFn                       on_token) {
     if (!model_ || ctx_pool_.empty() || !templates_) {
         return std::unexpected(ModelError{ModelErrorCode::InvalidConfig,
                                           "model not loaded"});
@@ -651,6 +669,9 @@ ChatModel::chat_completion(const std::vector<ChatMessage>& messages,
 
         const std::string piece = token_to_piece(vocab, cur);
         raw.append(piece);
+        if (on_token && !piece.empty()) {
+            on_token(piece);
+        }
 
         if (consume_stop_sequence(raw, all_stops)) {
             finish = "stop";

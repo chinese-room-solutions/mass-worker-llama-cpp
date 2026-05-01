@@ -32,18 +32,30 @@ std::string read_file_to_string(const std::string& path) {
 const char* hub_msg_kind(const mass::v1::worker::HubMessage& m) {
     using HM = mass::v1::worker::HubMessage;
     switch (m.msg_case()) {
-        case HM::kDeleteCacheFiles:    return "delete_cache_files";
-        case HM::kLoadChatModel:       return "load_chat_model";
-        case HM::kLoadEmbeddingModel:  return "load_embedding_model";
-        case HM::kUnloadModel:         return "unload_model";
-        case HM::kChatCompletion:      return "chat_completion";
-        case HM::kEmbedding:           return "embedding";
-        case HM::kBatchEmbedding:      return "batch_embedding";
-        case HM::kTokenize:            return "tokenize";
-        case HM::kBenchmark:           return "benchmark";
-        case HM::MSG_NOT_SET:          return "<empty>";
+        case HM::kAssignJob:          return "assign_job";
+        case HM::kCancelJob:          return "cancel_job";
+        case HM::kLoadModel:          return "load_model";
+        case HM::kUnloadModel:        return "unload_model";
+        case HM::kDeleteCacheFiles:   return "delete_cache_files";
+        case HM::kBenchmark:          return "benchmark";
+        case HM::kSetEnabledDevices:  return "set_enabled_devices";
+        case HM::MSG_NOT_SET:         return "<empty>";
     }
     return "<unknown>";
+}
+
+// Pull the job_id out of whichever HubMessage variant carries one. Used
+// purely for log breadcrumbs.
+std::string extract_job_id(const mass::v1::worker::HubMessage& m) {
+    using HM = mass::v1::worker::HubMessage;
+    switch (m.msg_case()) {
+        case HM::kAssignJob:   return m.assign_job().job_id();
+        case HM::kCancelJob:   return m.cancel_job().job_id();
+        case HM::kLoadModel:   return m.load_model().job_id();
+        case HM::kUnloadModel: return m.unload_model().job_id();
+        case HM::kBenchmark:   return m.benchmark().job_id();
+        default:               return {};
+    }
 }
 
 }  // namespace
@@ -99,7 +111,11 @@ bool Runner::run_one_session() {
 
     auto conn = client.open_connect_stream();
 
-    // Register first.
+    // gRPC sync ClientReaderWriter is *not* safe for concurrent Writes —
+    // declared up-front so the EmittedFn captures it by reference.
+    std::mutex write_mu;
+
+    // Send Register first.
     {
         auto reg = service_.registration();
         mass::v1::worker::WorkerMessage msg;
@@ -111,10 +127,6 @@ bool Runner::run_one_session() {
     }
     spdlog::info("connected to MASS");
 
-    // session_done flips when the stream's recv loop returns. Heartbeat and
-    // canceller threads observe it (in addition to the global stop signal)
-    // so a server-initiated disconnect tears them down cleanly without
-    // waiting for the heartbeat tick.
     std::atomic<bool> session_done{false};
     std::mutex local_mu;
     std::condition_variable local_cv;
@@ -131,9 +143,6 @@ bool Runner::run_one_session() {
         local_cv.notify_all();
     };
 
-    // gRPC sync ClientReaderWriter is *not* safe for concurrent Writes.
-    std::mutex write_mu;
-
     // Watcher thread: relays the global stop signal to the local CV and
     // cancels the gRPC context so blocking Read() returns immediately.
     std::jthread watcher([&]() {
@@ -142,8 +151,6 @@ bool Runner::run_one_session() {
             return stopping_.load(std::memory_order_acquire) ||
                    session_done.load(std::memory_order_acquire);
         });
-        // Cancel the gRPC stream so the receive loop unblocks. Safe to call
-        // even if the stream finished naturally.
         conn.context->TryCancel();
         wake_locals();
     });
@@ -158,13 +165,8 @@ bool Runner::run_one_session() {
             }
 
             mass::v1::worker::WorkerMessage msg;
-            auto* hb = msg.mutable_heartbeat();
-            for (auto& ds : service_.device_stats()) {
-                hb->mutable_device_stats()->AddAllocated(ds.release());
-            }
-            for (const auto& cf : service_.cache_files()) {
-                hb->add_cache_files(cf);
-            }
+            auto hb = service_.heartbeat();
+            msg.set_allocated_heartbeat(hb.release());
 
             std::lock_guard write_lk(write_mu);
             if (!conn.stream->Write(msg)) {
@@ -175,20 +177,26 @@ bool Runner::run_one_session() {
         }
     });
 
+    // EmittedFn: lets WorkerService push streaming chunks back to MASS
+    // mid-job. Currently only chat streaming uses this; sync paths return
+    // their result via the terminal frame instead.
+    EmittedFn emit = [&](const mass::v1::worker::WorkerMessage& msg) -> bool {
+        std::lock_guard write_lk(write_mu);
+        return conn.stream->Write(msg);
+    };
+
     // Receive loop. Each HubMessage either:
     //   - is a fire-and-forget DeleteCacheFiles → handle inline, no response
-    //   - is a job → run service_.execute(), send back WorkerJobResult
+    //   - is a job → run service_.execute(), send back the terminal
+    //     WorkerMessage (job_result / load_model / unload_model)
     //
-    // For now the dispatch is synchronous on the receive thread; Phase 6
-    // will move it onto a bounded worker pool so concurrent jobs don't
-    // serialize behind one another. Doing the simple thing first means
-    // the wire shape is testable today.
+    // Dispatch is synchronous on the receive thread. Concurrent jobs serialise
+    // through this loop; future work moves dispatch onto a bounded pool.
     mass::v1::worker::HubMessage incoming;
     while (conn.stream->Read(&incoming)) {
         spdlog::debug("received hub message: kind={} job_id={}",
-                      hub_msg_kind(incoming), incoming.job_id());
+                      hub_msg_kind(incoming), extract_job_id(incoming));
 
-        // Cache reconciliation is fire-and-forget — no JobResult expected.
         if (incoming.msg_case() == mass::v1::worker::HubMessage::kDeleteCacheFiles) {
             std::vector<std::string> names;
             for (const auto& s : incoming.delete_cache_files().filenames()) {
@@ -198,27 +206,22 @@ bool Runner::run_one_session() {
             continue;
         }
 
-        auto result = service_.execute(incoming);
-        if (!result) continue;
-        result->set_job_id(incoming.job_id());
-
-        mass::v1::worker::WorkerMessage out;
-        out.set_allocated_job_result(result.release());
+        auto out = service_.execute(incoming, emit);
+        if (!out) continue;
 
         std::lock_guard write_lk(write_mu);
-        if (!conn.stream->Write(out)) {
-            spdlog::warn("failed to send job result, closing stream");
+        if (!conn.stream->Write(*out)) {
+            spdlog::warn("failed to send terminal frame, closing stream");
             conn.context->TryCancel();
             break;
         }
     }
 
-    // Stream closed (server disconnect, cancel, or error). Tear down helpers.
     session_done.store(true, std::memory_order_release);
     wake_locals();
     {
         std::lock_guard lk(stop_mu_);
-        stop_cv_.notify_all();  // wakes the watcher even if no global stop
+        stop_cv_.notify_all();
     }
 
     auto status = conn.stream->Finish();
@@ -227,8 +230,6 @@ bool Runner::run_one_session() {
             spdlog::error("authentication failed: {}", status.error_message());
             return false;
         }
-        // CANCELLED is the gRPC mapping of our own TryCancel() — not really
-        // an error, just the natural outcome of a clean shutdown.
         if (status.error_code() != grpc::StatusCode::CANCELLED) {
             spdlog::warn("stream closed: {} ({})",
                          status.error_message(),

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -338,17 +339,25 @@ Fetcher::fetch_all(const std::vector<ModelFile>& files,
                                           "no model files provided"});
     }
     constexpr int kRolePrimary = 1;  // mass.v1.worker.MODEL_FILE_ROLE_PRIMARY
+    // Returned map is keyed by *iteration index* so callers can join back
+    // against the original request's parallel arrays. Role-uniqueness +
+    // primary-presence are enforced via a separate set so duplicates are
+    // still rejected without the map's keys becoming role values.
     std::map<int, fs::path> out;
-    for (const auto& f : files) {
-        auto path = fetch_one(f, cancel);
+    std::set<int>           seen_roles;
+    bool                    saw_primary = false;
+    for (int idx = 0; idx < static_cast<int>(files.size()); ++idx) {
+        const auto& f    = files[idx];
+        auto        path = fetch_one(f, cancel);
         if (!path) return std::unexpected(path.error());
-        if (out.contains(f.role)) {
+        if (!seen_roles.insert(f.role).second) {
             return std::unexpected(FetchError{FetchErrorCode::DuplicateRole,
                 "duplicate model file role: " + std::to_string(f.role)});
         }
-        out[f.role] = *path;
+        if (f.role == kRolePrimary) saw_primary = true;
+        out[idx] = *path;
     }
-    if (!out.contains(kRolePrimary)) {
+    if (!saw_primary) {
         return std::unexpected(FetchError{FetchErrorCode::NoPrimaryRole,
             "no PRIMARY model file in request"});
     }

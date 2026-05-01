@@ -35,7 +35,7 @@ struct ModelFile {
     std::string                         sha256;       // hex; empty → skip verify
     std::string                         local_path;   // non-empty → MASS signaled loopback
     std::map<std::string, std::string>  headers;      // extra HTTP headers (e.g. HF auth)
-    int                                 role{0};      // wire enum value (PRIMARY=1, PROJECTOR=2)
+    int                                 role{0};      // wire enum value of mass.v1.worker.ModelFileRole (PRIMARY=1, MMPROJ=2)
 };
 
 // Fetcher downloads ModelFiles into models_dir, verifying sha256 when

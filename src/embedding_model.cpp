@@ -89,8 +89,17 @@ std::expected<void, ModelError> EmbeddingModel::initialize() {
     }
     if (!cfg_.tensor_split.empty()) mparams.tensor_split = cfg_.tensor_split.data();
 
-    spdlog::info("loading embedding model path={} gpu_layers={} ctx={}",
-                 cfg_.path.string(), mparams.n_gpu_layers, context_size);
+    // Operator-controlled device whitelist (see chat_model.cpp).
+    std::vector<ggml_backend_dev_t> allowed_with_sentinel;
+    if (!cfg_.allowed_devices.empty()) {
+        allowed_with_sentinel = cfg_.allowed_devices;
+        allowed_with_sentinel.push_back(nullptr);
+        mparams.devices = allowed_with_sentinel.data();
+    }
+
+    spdlog::info("loading embedding model path={} gpu_layers={} ctx={} allowed_devices={}",
+                 cfg_.path.string(), mparams.n_gpu_layers, context_size,
+                 cfg_.allowed_devices.empty() ? "<all>" : std::to_string(cfg_.allowed_devices.size()));
 
     LlamaModelPtr model(llama_model_load_from_file(cfg_.path.string().c_str(), mparams));
     if (!model) {
