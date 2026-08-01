@@ -1,0 +1,5 @@
+              Install directory                     /home/u/.local/lib/mass
+            > Data directory                        /home/u/.local/share/mass
+              Installation scope                    < User >
+            > GPU backend                           < CUDA >
+              Model path                            /models/a/very/long/path/that…

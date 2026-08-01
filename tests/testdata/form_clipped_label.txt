@@ -1,0 +1,20 @@
+
+
+      __  __    _    ____  ____
+     |  \/  |  / \  / ___|/ ___|
+     | |\/| | / _ \ \___ \\___ \
+     |_|  |_|/_/ \_\|____/|____/
+     [ mass | 0.0.0 ]
+
+     Arrow keys move · edit a field · then choose an action.
+
+         > Installation scope                    < User >
+           Install directory                     /home/u/.local/lib/mass
+           A label long enough to cl…            value
+           Web UI listen address (ho…            :3455
+
+                        [ Install ]   [ Uninstall ]   [ Exit ]
+
+     Up/Down move · Left/Right change · Enter edit/confirm · Tab next · Esc cancel
+
+

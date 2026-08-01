@@ -1,4 +1,23 @@
 ---
+# The checks mechanise AGENTS.md. Style checks that fight the house
+# style are disabled rather than fought: single-line guard clauses,
+# #pragma once, kPascalCase constants, positional aggregate init,
+# pointer-truthiness tests, lowercase literal suffixes. Also disabled,
+# with reasons:
+#  - cert-err33-c: unchecked fprintf/fputs to the TUI — there is
+#    nothing to do when a terminal write fails.
+#  - cert-env33-c: system() deliberately drives platform integration
+#    (folder pickers, service management).
+#  - avoid-non-const-global-variables: the Windows SCM callback ABI has
+#    no context pointer, and the logger/llama registries are the Meyers
+#    singletons AGENTS.md sanctions.
+#  - easily-swappable-parameters: the (job_id, model_id, msg) frame
+#    builders trip it everywhere; call sites sit next to definitions.
+#  - function-cognitive-complexity: table-driven test bodies and the
+#    dispatch switches score high by construction.
+#  - pro-type-member-init: flags default-constructible class members in
+#    aggregates (readability-redundant-member-init rejects the {} that
+#    would silence it); the builtin members it exists for carry {}.
 Checks: >
   -*,
   bugprone-*,
@@ -9,24 +28,60 @@ Checks: >
   performance-*,
   portability-*,
   readability-*,
-  -modernize-use-trailing-return-type,
-  -readability-identifier-length,
+  -bugprone-easily-swappable-parameters,
+  -cert-err33-c,
+  -cert-env33-c,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
   -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
   -cppcoreguidelines-pro-bounds-pointer-arithmetic,
-  -cppcoreguidelines-avoid-magic-numbers,
-  -readability-magic-numbers,
+  -cppcoreguidelines-pro-type-member-init,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
   -cppcoreguidelines-pro-type-vararg,
-  -cppcoreguidelines-non-private-member-variables-in-classes,
-  -misc-non-private-member-variables-in-classes
+  -misc-non-private-member-variables-in-classes,
+  -modernize-avoid-c-arrays,
+  -modernize-use-designated-initializers,
+  -modernize-use-trailing-return-type,
+  -portability-avoid-pragma-once,
+  -readability-braces-around-statements,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -readability-magic-numbers,
+  -readability-uppercase-literal-suffix
 WarningsAsErrors: ''
 HeaderFilterRegex: '(include/mass_worker|src)/.*'
+# Vendored llama.cpp paths contain both "src/" and "include/", so the
+# filter above matches them; carve them out explicitly.
+ExcludeHeaderFilterRegex: '.*(third_party|vcpkg_installed)/.*'
 FormatStyle: file
 CheckOptions:
-  readability-identifier-naming.ClassCase:           CamelCase
-  readability-identifier-naming.StructCase:          CamelCase
-  readability-identifier-naming.EnumCase:            CamelCase
-  readability-identifier-naming.FunctionCase:        lower_case
-  readability-identifier-naming.VariableCase:        lower_case
-  readability-identifier-naming.PrivateMemberSuffix: _
-  readability-identifier-naming.ConstantCase:        lower_case
-  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  readability-identifier-naming.ClassCase:               CamelCase
+  readability-identifier-naming.StructCase:              CamelCase
+  readability-identifier-naming.EnumCase:                CamelCase
+  readability-identifier-naming.EnumConstantCase:        CamelCase
+  readability-identifier-naming.FunctionCase:            lower_case
+  readability-identifier-naming.VariableCase:            lower_case
+  readability-identifier-naming.PrivateMemberSuffix:     _
+  # Const members are members first: without these, ConstantCase (no
+  # suffix) outranks PrivateMemberSuffix and strips the trailing
+  # underscore — turning ctor-init-list member references into parameter
+  # references, a silent use-after-move.
+  readability-identifier-naming.ConstantMemberCase:      lower_case
+  readability-identifier-naming.ConstantMemberSuffix:    _
+  readability-identifier-naming.ConstantCase:            lower_case
+  readability-identifier-naming.ConstexprVariableCase:   CamelCase
+  readability-identifier-naming.ConstexprVariablePrefix: k
+  readability-identifier-naming.GlobalConstantCase:      CamelCase
+  readability-identifier-naming.GlobalConstantPrefix:    k
+  readability-identifier-naming.StaticConstantCase:      CamelCase
+  readability-identifier-naming.StaticConstantPrefix:    k
+  readability-identifier-naming.ClassConstantCase:       CamelCase
+  readability-identifier-naming.ClassConstantPrefix:     k
+  readability-identifier-naming.MacroDefinitionCase:     UPPER_CASE
+  cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor: true
+  # AGENTS.md sanctions (void)-discard for fire-and-forget shutdown paths.
+  bugprone-unused-return-value.AllowCastToVoid: true
+  cppcoreguidelines-special-member-functions.AllowMissingMoveFunctionsWhenCopyIsDeleted: true

@@ -1,12 +1,13 @@
 #pragma once
 
-#include <chrono>
-#include <memory>
-#include <string>
-
 #include <grpcpp/channel.h>
 #include <grpcpp/client_context.h>
+#include <grpcpp/support/status_code_enum.h>
 #include <grpcpp/support/sync_stream.h>
+
+#include <memory>
+#include <string>
+#include <string_view>
 
 #include "worker/worker.grpc.pb.h"
 
@@ -18,9 +19,47 @@ namespace mass_worker {
 // the system trust store is used.
 struct MassClientConfig {
     std::string mass_url;
-    std::string auth_token;  // optional bearer; sent as metadata "authorization: Bearer <token>"
-    std::string ca_pem;      // optional CA bundle (file contents, not path); empty → system roots
+    // Bearer credential sent as metadata "authorization: Bearer <auth_token>".
+    // Enrolling: the one-time join token. Enrolled: the per-worker secret.
+    std::string auth_token;
+    // Server-assigned worker identity, sent as metadata "x-mass-worker-id:
+    // <worker_id>" on every enrolled connect. Empty while enrolling (no identity
+    // yet — MASS assigns one and returns it in WorkerEnrolled).
+    std::string worker_id;
+    std::string ca_pem;  // optional CA bundle (file contents, not path); empty → system roots
 };
+
+// The gRPC dial target derived from a MASS URL: the scheme selects TLS, the
+// target is host[:port] only. Anything a gRPC dial target cannot express —
+// userinfo (user:pass@), a path, query, or fragment — is stripped with a
+// warning instead of silently producing a bogus target; a bare trailing "/"
+// is stripped silently (harmless copy-paste artifact). Exposed for testing.
+struct ParsedUrl {
+    std::string target;
+    bool use_tls;
+};
+[[nodiscard]] ParsedUrl parse_url(const std::string& url);
+
+// Why an enrollment attempt died, phrased for the operator. The gRPC status is
+// the diagnosis, never the mere presence of a join token: MASS answers every
+// credential problem — no token, invalid or expired token, unknown or revoked
+// worker, wrong per-worker secret — with UNAUTHENTICATED, and every server-side
+// failure (a failed insert, a broken schema) with INTERNAL or another code
+// carrying the real cause. So only the credential codes earn a token
+// hypothesis; anything else is reported exactly as MASS phrased it, so a server
+// fault never sends the operator hunting for a token they don't need. An empty
+// message means the stream simply closed, leaving only the code to report.
+// Pure; exposed for testing.
+[[nodiscard]] std::string enrollment_failure_message(bool had_token, grpc::StatusCode code,
+                                                     std::string_view server_message);
+
+// Whether an enrollment failure with this status is worth reconnecting for.
+// Credential and malformed-request errors need an operator to change something
+// the worker cannot change by retrying, so they end the process; every other
+// code describes a server-side condition that may well be repaired while the
+// worker is up, so the worker backs off and retries instead of exiting. Pure;
+// exposed for testing.
+[[nodiscard]] bool enrollment_error_is_fatal(grpc::StatusCode code);
 
 // MassClient owns a long-lived grpc::Channel to MASS plus a worker-hub stub
 // built on top of it. Cheap to construct, cheap to copy the inner stub_;
@@ -31,11 +70,13 @@ class MassClient {
 public:
     explicit MassClient(MassClientConfig cfg);
 
+    ~MassClient() = default;
+
     MassClient(const MassClient&) = delete;
     MassClient& operator=(const MassClient&) = delete;
 
-    using Stream = grpc::ClientReaderWriter<
-        mass::v1::worker::WorkerMessage, mass::v1::worker::HubMessage>;
+    using Stream =
+        grpc::ClientReaderWriter<mass::v1::worker::WorkerMessage, mass::v1::worker::HubMessage>;
 
     // Open a fresh Connect() bidi stream. Returns the stream + the
     // ClientContext that owns its deadlines/cancellation. Caller keeps the
@@ -45,10 +86,6 @@ public:
         std::unique_ptr<Stream> stream;
     };
     [[nodiscard]] Connection open_connect_stream();
-
-    // Wait up to `timeout` for the underlying channel to become connected.
-    // Useful as a liveness check before sending the Register frame.
-    bool wait_for_connection(std::chrono::milliseconds timeout) const;
 
     [[nodiscard]] const std::string& mass_url() const { return cfg_.mass_url; }
 

@@ -1,0 +1,16 @@
+ __  __    _    ____  ____
+|  \/  |  / \  / ___|/ ___|
+| |\/| | / _ \ \___ \\___ \
+|_|  |_|/_/ \_\|____/|____/
+[ mass | 0.0.0 ]
+
+
+Uninstalling removes the staged binaries and the launcher from this
+machine.
+The data directory and everything in it is kept, so a later reinstall
+picks your settings back up.
+Continue?
+
+[ Yes ]   [ No ]
+
+←/→ or Tab move · Enter confirm · y / n · Esc cancels

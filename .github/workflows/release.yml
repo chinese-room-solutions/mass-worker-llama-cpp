@@ -1,0 +1,300 @@
+name: release
+
+# On a version tag (or manual dispatch), build the native worker on each
+# target OS and attach the archived binary + raw installer to a single GitHub
+# Release. GPU backend per OS: Metal on Apple Silicon (native), Vulkan
+# elsewhere (cross-vendor). CUDA is a separate opt-in build and is not shipped
+# here. The active build legs run on self-hosted runners (no billed
+# minutes); only the publish job uses a hosted runner. CI covers the
+# Linux/Vulkan leg alone. The Windows leg is currently PARKED (commented out
+# in the matrix) until a self-hosted Windows runner exists.
+#
+# Mirrors ci.yml's vcpkg + mass-proto setup. Hosted-runner dep-install steps
+# are kept (gated on runner.environment) so a leg can be pointed back at a
+# hosted runner by editing only its matrix entry.
+#
+# DO NOT push a v* tag before every ACTIVE leg's self-hosted runner is
+# registered and online: a leg with no matching runner sits queued (~24h,
+# then fails), and publish (needs: build) never runs — the release keeps
+# stale assets.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # vcpkg's GitHub-Actions ('x-gha') binary cache was removed upstream, so we
+  # cache the built packages ourselves via the 'files' backend + actions/cache.
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
+  # Pinned vcpkg commit — deterministic dep versions + a stable cache key.
+  VCPKG_COMMIT: 59acc80b235ac2a9457cc8b8c0fddfb9551019a6
+  MASS_PROTO_DIR: ${{ github.workspace }}/mass-proto
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Release-only triplets: no debug builds of the deps (halves vcpkg
+        # time/disk). Windows is static so the single-exe archive is
+        # self-contained — the default x64-windows triplet builds DLLs the
+        # shipped exe wouldn't find.
+        # `asset` is the release-asset basename: <name>_<goos>_<goarch>, no
+        # version — stable names keep releases/latest/download/ links evergreen
+        # (the website and READMEs hardcode them). The `_cuda` suffix is
+        # reserved for a future opt-in CUDA build (not shipped here).
+        include:
+          # `setup_asset` is the stable name of the RAW installer binary (the
+          # self-extracting mass-worker-setup, not the double-clickable
+          # container) — the join bootstrap fetches and execs it with
+          # --non-interactive, so it needs a container-free executable at an
+          # evergreen releases/latest/download URL.
+          - os: [self-hosted, Linux, X64]
+            label: linux-amd64
+            triplet: x64-linux-release
+            asset: mass-worker-llama-cpp_linux_amd64
+            setup_asset: mass-worker-setup_linux_amd64
+          # Self-hosted Windows/macOS runners are pre-provisioned (the dep
+          # install steps below are hosted-only). Provision before registering:
+          #   Windows (labels: self-hosted, Windows, X64): VS Build Tools
+          #     (MSVC x64), Ninja, GNU make, 7-Zip, Git for Windows (the
+          #     runner needs git-bash for `shell: bash`), Vulkan SDK with
+          #     VULKAN_SDK set machine-wide (loader + glslc).
+          #   macOS (labels: self-hosted, macOS, ARM64): Xcode command line
+          #     tools, ninja, make, autoconf, automake, libtool.
+          # Windows leg is PARKED until a self-hosted Windows runner exists.
+          # Uncomment to activate; provision the box per the notes above first.
+          # Windows uses the repo's static-md-rel overlay triplet — the same
+          # config the local `make package` ships (static deps, dynamic CRT,
+          # release-only); the stock x64-windows-static-release (static CRT)
+          # has never been built here.
+          # - os: [self-hosted, Windows, X64]
+          #   label: windows-amd64
+          #   triplet: x64-windows-static-md-rel
+          #   asset: mass-worker-llama-cpp_windows_amd64
+          #   setup_asset: mass-worker-setup_windows_amd64
+          - os: [self-hosted, macOS, ARM64]
+            label: macos-arm64
+            triplet: arm64-osx-release
+            asset: mass-worker-llama-cpp_darwin_arm64
+            setup_asset: mass-worker-setup_darwin_arm64
+    steps:
+      - name: Checkout mass-worker-llama-cpp
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: mass-worker-llama-cpp
+
+      - name: Checkout mass-proto (sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: chinese-room-solutions/mass-proto
+          token: ${{ secrets.GH_PAT }}
+          path: mass-proto
+
+      # Persist vcpkg's built packages across runs. Key on label + the pinned
+      # vcpkg commit + a hash of the manifest, so it invalidates only on changes.
+      # restore/save are split so the save runs even when a later step fails
+      # (plain actions/cache skips its save on job failure, which would throw
+      # away an hour of vcpkg builds when e.g. the archive step breaks).
+      - name: Restore vcpkg packages
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-cache
+          key: vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('mass-worker-llama-cpp/vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-
+
+      # Hosted runners only: the self-hosted runner is pre-provisioned (CI
+      # builds Vulkan on it) and its user has no passwordless sudo.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build pkg-config autoconf automake libtool curl zip unzip tar \
+            libvulkan-dev glslang-tools
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS' && runner.environment == 'github-hosted'
+        run: brew install ninja autoconf automake libtool
+
+      - name: Install Windows build deps
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        run: choco install -y ninja
+
+      # macOS uses Metal (the native Apple-Silicon GPU backend), not Vulkan, so
+      # the Vulkan SDK is installed on Windows only. Linux gets it from apt
+      # above; a self-hosted Windows runner pre-provisions it (VULKAN_SDK env).
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: latest
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, glslang, SPIRV-Tools
+          vulkan-use-cache: true
+
+      # Caches compiled objects for the vendored llama.cpp/ggml tree + our own
+      # sources (the part vcpkg's binary cache doesn't cover). ccache on
+      # Linux/macOS, sccache on Windows; CMake picks it up as the launcher.
+      - name: Compiler cache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: release-${{ matrix.label }}
+          variant: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
+
+      - name: Bootstrap vcpkg
+        shell: bash
+        env:
+          # Hide the runner user's ~/.gitconfig from vcpkg's git: an https->ssh
+          # insteadOf rewrite (present on the self-hosted macOS runner) pushes
+          # promisor fetches onto SSH, where GitHub's connection-rate throttle
+          # resets them. Step-scoped because actions/checkout must WRITE global
+          # config and fails on /dev/null. Same guard as ci.yml. Empty on
+          # Windows: the /dev/null path is POSIX-only, and this step shells out
+          # to bootstrap-vcpkg.bat (native git, no MSYS path translation).
+          GIT_CONFIG_GLOBAL: ${{ runner.os != 'Windows' && '/dev/null' || '' }}
+        run: |
+          # Treeless partial clone (~30MB): vcpkg resolves the manifest's
+          # builtin-baseline via `git show` on the versions db, which needs the
+          # full commit graph — a shallow single-commit fetch can't serve it.
+          # Trees/blobs are fetched lazily; the pinned checkout keeps the
+          # toolchain deterministic and the cache key stable.
+          git clone --filter=tree:0 --no-checkout https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          git -C "$RUNNER_TEMP/vcpkg" checkout "$VCPKG_COMMIT"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          else
+            "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
+      # Ninja needs cl on PATH; the runner shell has no VS environment. Same
+      # compiler then configures our tree AND builds the vcpkg deps, so the
+      # Makefile's toolset-mismatch hazard (vcpkg vs generator picking
+      # different MSVC versions) can't arise here.
+      - name: MSVC build environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        working-directory: mass-worker-llama-cpp
+        shell: bash
+        env:
+          # vcpkg install runs inside configure and lazily git-fetches port
+          # trees — same insteadOf hazard as the bootstrap step.
+          GIT_CONFIG_GLOBAL: ${{ runner.os != 'Windows' && '/dev/null' || '' }}
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            gpu=(-DMASS_WORKER_LLAMA_METAL=ON -DMASS_WORKER_LLAMA_VULKAN=OFF)
+          else
+            gpu=(-DMASS_WORKER_LLAMA_VULKAN=ON -DMASS_WORKER_LLAMA_METAL=OFF)
+          fi
+          extra=()
+          # The Windows triplet is an in-repo overlay (see the matrix comment).
+          [ "$RUNNER_OS" = "Windows" ] && extra=(-DVCPKG_OVERLAY_TRIPLETS="$PWD/triplets")
+          cmake -B build -S . \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DVCPKG_HOST_TRIPLET=${{ matrix.triplet }} \
+            -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build \
+            -DMASS_PROTO_DIR="$MASS_PROTO_DIR" \
+            "${gpu[@]}" \
+            "${extra[@]}" \
+            -DMASS_WORKER_LLAMA_CUDA=OFF
+
+      - name: Build
+        working-directory: mass-worker-llama-cpp
+        run: cmake --build build --config Release -j
+
+      # Installer wizard (mass-worker-setup + worker + libs as payload),
+      # wrapped double-clickable: .AppImage on Linux, .app on macOS, plain
+      # .exe on Windows. The bundler self-fetches appimagetool. `make package`'s
+      # `build` prerequisite sees build/CMakeCache.txt from the Configure step
+      # above and skips reconfiguration, so the Ninja generator + release
+      # triplet this job set are untouched (the Makefile's local-dev flags —
+      # MSVC toolset pin, static-md-rel overlay triplet — never reach the tree).
+      # KEEP_RAW_INSTALLER=1 stops `make package` from deleting the raw
+      # self-extracting installer after it bundles it into the container, so the
+      # Archive step below can rename + upload it for the join bootstrap.
+      - name: Package installer
+        working-directory: mass-worker-llama-cpp
+        run: make package KEEP_RAW_INSTALLER=1
+
+      - name: Archive
+        working-directory: mass-worker-llama-cpp
+        shell: bash
+        run: |
+          name="${{ matrix.asset }}"
+          setup="mass-worker-llama-cpp-setup_${name#mass-worker-llama-cpp_}"
+          # Stable name of the raw self-extracting installer (container-free),
+          # for the join bootstrap to fetch + exec.
+          raw="${{ matrix.setup_asset }}"
+          # Single-config generators (Ninja) drop the binary directly in build/bin.
+          bin="build/bin/mass-worker-llama-cpp"
+          [ "$RUNNER_OS" = "Windows" ] && bin="build/bin/mass-worker-llama-cpp.exe"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$name.zip" "./$bin"
+            # Windows needs no container (the console exe gets its own terminal),
+            # so make package leaves only the raw dist/mass-worker-setup.exe: it
+            # serves as both the double-clickable installer and the raw bootstrap
+            # asset. Copy (not move) so both stable names ship.
+            cp dist/mass-worker-setup.exe "$setup.exe"
+            mv dist/mass-worker-setup.exe "$raw.exe"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            tar -czf "$name.tar.gz" -C build/bin "$(basename "$bin")"
+            # make-bundle emits a .app dir; zip it transfer-safe (ditto keeps
+            # the bundle's exec bits, a plain zip of a .app loses them).
+            ditto -c -k --keepParent dist/*.app "$setup.zip"
+            mv dist/mass-worker-setup "$raw"
+          else
+            tar -czf "$name.tar.gz" -C build/bin "$(basename "$bin")"
+            mv dist/*.AppImage "$setup.AppImage"
+            mv dist/mass-worker-setup "$raw"
+          fi
+
+      - name: Save vcpkg packages
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-cache
+          key: vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('mass-worker-llama-cpp/vcpkg.json') }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            mass-worker-llama-cpp/*.tar.gz
+            mass-worker-llama-cpp/*.zip
+            mass-worker-llama-cpp/mass-worker-llama-cpp-setup_*
+            mass-worker-llama-cpp/${{ matrix.setup_asset }}*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/*.AppImage
+            artifacts/**/*.exe
+            artifacts/**/mass-worker-setup_*
+          generate_release_notes: true

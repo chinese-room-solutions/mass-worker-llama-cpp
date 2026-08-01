@@ -7,9 +7,11 @@
 
 namespace mass_worker {
 
-void init_logging(spdlog::level::level_enum level, const std::string& log_file) {
+void init_logging(spdlog::level::level_enum level, const std::string& log_file, bool console) {
     std::vector<spdlog::sink_ptr> sinks;
-    sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
+    if (console) {
+        sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
+    }
     if (!log_file.empty()) {
         // 5 MB × 3 files keeps a few minutes of debug logs without growing
         // unbounded; the file flushes on every error so a crash leaves the
@@ -26,13 +28,13 @@ void init_logging(spdlog::level::level_enum level, const std::string& log_file) 
 }
 
 spdlog::level::level_enum parse_level(std::string_view name) {
-    if (name == "trace")    return spdlog::level::trace;
-    if (name == "debug")    return spdlog::level::debug;
-    if (name == "info")     return spdlog::level::info;
-    if (name == "warn")     return spdlog::level::warn;
-    if (name == "error")    return spdlog::level::err;
+    if (name == "trace") return spdlog::level::trace;
+    if (name == "debug") return spdlog::level::debug;
+    if (name == "info") return spdlog::level::info;
+    if (name == "warn") return spdlog::level::warn;
+    if (name == "error") return spdlog::level::err;
     if (name == "critical") return spdlog::level::critical;
-    if (name == "off")      return spdlog::level::off;
+    if (name == "off") return spdlog::level::off;
     return spdlog::level::info;
 }
 

@@ -17,15 +17,25 @@ namespace mass_worker {
 // Per-model embedding load configuration. Mirrors LlamaEmbeddingConfig.
 struct EmbeddingModelLoadConfig {
     std::filesystem::path path;
-    int32_t context_size{0};      // 0 → 4096
-    int32_t gpu_layers{0};        // wire convention (0=auto-all, -1=cpu)
+    int32_t context_size{0};  // 0 → 4096
+    int32_t gpu_layers{0};    // wire convention (0=auto-all, -1=cpu)
     int32_t threads{0};
-    int32_t max_concurrent{1};    // pool size: number of contexts
-    std::string main_gpu;
-    std::vector<float> tensor_split;
+    int32_t max_concurrent{0};  // 0 → grow to the headroom watermark; N>0 → explicit ceiling
+    // VRAM headroom watermark, 1-100 (see CtxPoolHeadroom). Embed slots
+    // are small individually, but an ungated pool on an iGPU grows into
+    // the tens of slots and leaves decode-time allocations nothing.
+    int32_t vram_headroom_pct{75};
 
     // Operator-controlled device whitelist (see ChatModelLoadConfig).
     std::vector<ggml_backend_dev_t> allowed_devices;
+
+    // Canonical IDs ("gpu:N" / "cpu:0") of every device this model will
+    // actually occupy (see ChatModelLoadConfig::device_ids).
+    std::vector<std::string> device_ids;
+
+    // On-disk calibration cache for the auto slot ceiling (see
+    // calib_cache.hpp). Empty → measure on every load.
+    std::filesystem::path calib_cache_file;
 };
 
 struct EmbedPoolSlot;
@@ -35,44 +45,49 @@ struct EmbedPoolSlot;
 // contexts; the model weights are shared.
 class EmbeddingModel {
     friend struct EmbedPoolSlot;
+
 public:
-    [[nodiscard]] static std::expected<std::shared_ptr<EmbeddingModel>, ModelError>
-    load(EmbeddingModelLoadConfig cfg);
+    [[nodiscard]] static std::expected<std::shared_ptr<EmbeddingModel>, ModelError> load(
+        EmbeddingModelLoadConfig cfg);
 
     ~EmbeddingModel();
     EmbeddingModel(const EmbeddingModel&) = delete;
     EmbeddingModel& operator=(const EmbeddingModel&) = delete;
 
     // Embed one input string. Returns the per-sequence pooled vector.
-    [[nodiscard]] std::expected<std::vector<float>, ModelError>
-    embed(const std::string& text);
-
-    // Embed many inputs in sequence. Returns one vector per input in order.
-    [[nodiscard]] std::expected<std::vector<std::vector<float>>, ModelError>
-    embed_batch(const std::vector<std::string>& inputs);
+    // is_cancelled is polled while waiting for a pool slot and before the
+    // decode; on cancel returns ModelErrorCode::Cancelled. Safe to call
+    // concurrently up to pool_size(); batch jobs fan out over this via
+    // run_batch_items in the worker service.
+    [[nodiscard]] std::expected<std::vector<float>, ModelError> embed(
+        const std::string& text, const IsCancelledFn& is_cancelled = nullptr);
 
     [[nodiscard]] std::vector<std::filesystem::path> backing_paths() const;
     [[nodiscard]] const EmbeddingModelLoadConfig& config() const { return cfg_; }
 
-    [[nodiscard]] int32_t pool_size() const {
-        return static_cast<int32_t>(ctx_pool_.size());
-    }
+    [[nodiscard]] int32_t pool_size() const { return static_cast<int32_t>(ctx_pool_.size()); }
+
+    // Canonical device IDs this model occupies. Mirrors cfg.device_ids
+    // populated at load time by WorkerService.
+    [[nodiscard]] const std::vector<std::string>& device_ids() const { return cfg_.device_ids; }
 
 private:
     explicit EmbeddingModel(EmbeddingModelLoadConfig cfg);
     [[nodiscard]] std::expected<void, ModelError> initialize();
 
-    llama_context* acquire_ctx();
-    void           release_ctx(llama_context* ctx);
+    // Same contract as ChatModel::acquire_ctx: blocks until a slot frees or
+    // is_cancelled fires (polled), returning nullptr on cancel.
+    llama_context* acquire_ctx(const IsCancelledFn& is_cancelled);
+    void release_ctx(llama_context* ctx);
 
-    EmbeddingModelLoadConfig     cfg_;
-    LlamaModelPtr                model_;
+    EmbeddingModelLoadConfig cfg_;
+    LlamaModelPtr model_;
     std::vector<LlamaContextPtr> ctx_pool_;
-    int32_t                      n_embd_{0};
+    int32_t n_embd_{0};
 
-    std::mutex                   pool_mu_;
-    std::condition_variable      pool_cv_;
-    std::vector<llama_context*>  free_ctxs_;
+    std::mutex pool_mu_;
+    std::condition_variable pool_cv_;
+    std::vector<llama_context*> free_ctxs_;
 };
 
 }  // namespace mass_worker

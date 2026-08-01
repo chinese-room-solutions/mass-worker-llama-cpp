@@ -1,5 +1,7 @@
 #include "mass_worker/llama_backend.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
@@ -7,12 +9,10 @@
 #include <mutex>
 #include <string>
 
-#include <spdlog/spdlog.h>
-
 #include "ggml.h"
 #include "llama.h"
-#include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd.h"
 
 namespace mass_worker {
 
@@ -20,17 +20,27 @@ namespace {
 
 std::once_flag g_init_flag;
 
+// Per-thread nesting depth of LlamaLogQuietScope. While > 0, ERROR-level llama
+// logs on this thread are demoted to DEBUG (an expected, swallowed failure).
+thread_local int g_quiet_depth = 0;
+
 // Map ggml log levels to spdlog levels. ggml's level set is the same shape
 // as spdlog's; this just bridges the enums.
 spdlog::level::level_enum to_spdlog(ggml_log_level lvl) {
     switch (lvl) {
-        case GGML_LOG_LEVEL_DEBUG: return spdlog::level::debug;
-        case GGML_LOG_LEVEL_INFO:  return spdlog::level::info;
-        case GGML_LOG_LEVEL_WARN:  return spdlog::level::warn;
-        case GGML_LOG_LEVEL_ERROR: return spdlog::level::err;
-        case GGML_LOG_LEVEL_CONT:  return spdlog::level::info;  // continuation line
+        case GGML_LOG_LEVEL_DEBUG:
+            return spdlog::level::debug;
+        case GGML_LOG_LEVEL_INFO:
+            return spdlog::level::info;
+        case GGML_LOG_LEVEL_WARN:
+            return spdlog::level::warn;
+        case GGML_LOG_LEVEL_ERROR:
+            return spdlog::level::err;
+        case GGML_LOG_LEVEL_CONT:
+            return spdlog::level::info;  // continuation line
         case GGML_LOG_LEVEL_NONE:
-        default:                   return spdlog::level::trace;
+        default:
+            return spdlog::level::trace;
     }
 }
 
@@ -43,10 +53,21 @@ void log_cb(ggml_log_level lvl, const char* text, void* /*user*/) {
         msg.pop_back();
     }
     if (msg.empty()) return;
-    spdlog::log(to_spdlog(lvl), "[llama] {}", msg);
+    auto level = to_spdlog(lvl);
+    if (g_quiet_depth > 0 && level == spdlog::level::err) {
+        level = spdlog::level::debug;  // expected failure inside a quiet scope.
+    }
+    spdlog::log(level, "[llama] {}", msg);
 }
 
 }  // namespace
+
+LlamaLogQuietScope::LlamaLogQuietScope() {
+    ++g_quiet_depth;
+}
+LlamaLogQuietScope::~LlamaLogQuietScope() {
+    --g_quiet_depth;
+}
 
 void init_llama_backend_once() {
     std::call_once(g_init_flag, [] {

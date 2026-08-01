@@ -1,112 +1,60 @@
-# AGENTS.md — mass-worker-llama-cpp
+## Working style
+- Top-level agent: plan, orchestrate, and review. Make simple changes yourself — a settled, small, contained edit costs more to hand off than to make.
+- Delegate the rest, at most 2 subagents at a time: work spanning several files, needing its own exploration, or running long. Each starts cold — hand it the diagnosis, file refs, design, environment setup, and what to verify.
+- Subagent: do the work yourself. Never spawn further agents.
+- Scale verification to the risk of being wrong. A cosmetic markup/CSS change needs a rebuild and one look at it; a cross-engine, multi-file, or unproven diagnosis needs measured numbers. Over-specified verification is how a small fix gets expensive.
+- Verify a diagnosis against current code before fixing it. One commit per fix.
 
-These conventions translate the Go AGENTS.md from the MASS repo to C++ idioms.
-Apply them throughout this codebase.
+## Code quality
+- Follow the best practices of this repo's stack (C++23, CMake + vcpkg), and good project organization.
+- Write simple, reusable, maintainable code. Maintainability and simplicity come first; seek optimizations only after that.
+- Don't use dirty workarounds unless there's truly no other way.
+- You can and should make any breaking changes needed.
+- Avoid over-generalizing for hypothetical future use — write the minimal thing first; add the template or virtual base when a second concrete need shows up.
+- This repo mirrors the sibling Go repos: `Interface`-suffixed interfaces, table-driven tests, `make` entry points. Behavior ported from mass-sdk (installer TUI, forms, terminal layout) stays in parity with the Go original — fix both sides or neither.
 
-## Core principles
-- Best modern C++ practices (C++20). Simple, reusable, maintainable code.
-- Optimize where it pays off, but maintainability and simplicity come first.
-- Use proper abstraction only where truly required. Abstractions belong at
-  the seams (subsystem boundaries, RPC edges, RAII wrappers around C APIs)
-  — not mid-code. Three similar lines is better than a premature template.
-- Avoid over-generalizing for hypothetical future use — write the minimal
-  thing first. Add the template / virtual base / policy class when a
-  second concrete need actually shows up.
-- Design for reversibility: keep features self-contained and don't leak
-  concerns across boundaries. Ask "what would it take to delete this?"
-  before committing something.
-- Breaking changes are fine when they make the code better.
-- After making changes, revisit them: simpler? something now unused? remove it.
+## Tidiness
+- Revisit your changes: simplify what can be simplified, remove what's no longer needed, and don't leave unnecessary moves behind.
+- When a fix lands after several attempts, revisit the trail before committing: re-verify each accumulated change is load-bearing (would the issue return without it?) and revert the ones that aren't — ship only the code that actually fixes the issue.
+- Comment only the WHY — invariant, race window, surprising constraint — never what the code does. If a careful reader wouldn't miss it, delete it.
+- Abstractions belong at the seams (subsystem boundaries, RPC edges, RAII wrappers around C APIs), not mid-code. Three similar lines beat a premature template.
+- Design for reversibility: keep features self-contained, don't leak concerns across boundaries, and ask "what would it take to delete this?" before committing.
 
-## Style
-- C++20 throughout. RAII for everything resource-shaped. No raw `new`/`delete` —
-  `std::unique_ptr` / `std::shared_ptr` / `std::vector` etc.
-- Prefer value semantics; pass by `const&` when borrowing, by value when moving.
-- `auto` for type-obvious locals; spell out types when it aids reading.
-- Headers in `include/mass_worker/`, .cpp in `src/`. One class per pair when sensible.
-- Naming: `snake_case` for functions/variables, `PascalCase` for types,
-  `kPascalCase` for constants, `_trailing_underscore` for member vars.
-- Interfaces: suffix with `Interface` (matches the parent project's Go style:
-  e.g. `LoaderInterface`, `HardwareInterface`).
-- 4-space indent, brace-on-same-line, `clang-format` config in repo root.
-- Keep code comments/docs consise and clean.
-
-## Errors
-- Use `std::expected<T, E>` for fallible operations (C++23 in toolchains; if
-  unavailable, use `tl::expected` or a thin in-house equivalent in
-  `include/mass_worker/expected.hpp`).
-- Define a small set of `enum class` error codes per subsystem (`LoadError`,
-  `RpcError`, etc.); attach a human-readable message via a paired struct.
-- **Never silently swallow errors.** Every error path either:
-  - returns/propagates the error to a caller that can act on it, OR
-  - logs at the call site with the full context (subsystem fields + error code), OR
-  - aborts via `std::terminate` for invariant violations that should never happen.
-- Don't `(void)expr` away a `[[nodiscard]]` result, and don't ignore an
-  `std::expected` by destructuring only the value. Either handle the
-  error, propagate it up, or log it — same rule as the parent project's
-  Go "never `_ =` an error". The narrow exemption is genuinely
-  fire-and-forget calls in shutdown paths where there is nothing the
-  caller could do with the failure; even then, prefer a one-line log.
-- Exceptions are reserved for unrecoverable invariants (out-of-memory, broken
-  protobuf state). Don't throw across API boundaries; return `std::expected` instead.
-- Prefer fail-fast on programmer errors (assertions, contract violations) over
-  defensive fallbacks that hide bugs.
-
-## Logging
-- Use **spdlog** everywhere. Get loggers from a central registry in
-  `include/mass_worker/logging.hpp`.
-- Structured fields where it helps grep: `spdlog::info("loaded model fp={} path={}", fp, path)`.
-- Levels: `trace` (very verbose dev), `debug` (devs), `info` (operational
-  events), `warn` (recoverable degradation), `error` (failed operation),
-  `critical` (process about to die).
-- No `std::cout`/`std::cerr` for diagnostics — they bypass log levels and routing.
+## Cross-platform
+- All code targets Windows, Linux, and macOS. Per-OS code goes in suffixed files (`service_windows.cpp`, `gpu_util_linux.cpp`, `gpu_util_darwin.mm`) selected in CMakeLists — not `#ifdef` soup mid-function.
+- Shipped binaries find their libraries via scoped RPATH (`$ORIGIN` on Linux, `@loader_path` on macOS). If you can't verify a platform path on the current OS, say so explicitly rather than assuming it works.
 
 ## Concurrency
-- Default to `std::jthread` (RAII, cooperative cancellation via `std::stop_token`).
-- Use `std::mutex` + `std::lock_guard` / `std::unique_lock`. `std::shared_mutex`
-  for read-heavy maps. Keep critical sections small.
-- Prefer message passing over shared state where it's natural (the worker pool
-  and the gRPC stream are good places for channels — see the model-pool design).
-- Watch for TOCTOU between "check pool state" and "acquire instance" — same
-  bug class as in MASS's scheduler. Hold the lock across the check + the
-  state mutation, or use atomic flags to gate.
+- Default to `std::jthread` with cooperative cancellation via `std::stop_token`; every thread has a defined owner and exit path.
+- Keep critical sections small; never hold a lock across I/O or an inference call. But don't split check from mutate — hold the lock across both (the check-pool-state / acquire-instance TOCTOU is a real bug class here).
+- No global mutable state. Meyers singletons only for genuinely process-singleton concerns (logger registry, llama backend init).
 
-## Tests
-- **GoogleTest** + GMock. Mirror the parent project's table-driven test style:
-  parameterised tests via `INSTANTIATE_TEST_SUITE_P` for cases with the same
-  shape but different inputs.
-- Tests live in `tests/` and are organised by subsystem (one `.cpp` per
-  source file under test, where practical).
-- `make test` (= `ctest --output-on-failure -j`) must pass on every commit.
+## Error handling
+- Fallible operations return `std::expected<T, E>` with a small per-subsystem `enum class` error code (`ServiceError`, `StageError`, …) and a human-readable message.
+- Never silently swallow an error: propagate to a caller that can act on it, or log with full context at the call site. Don't `(void)` away a `[[nodiscard]]` result. The narrow exemption is fire-and-forget in shutdown paths — even there, prefer a one-line log.
+- Exceptions are for unrecoverable invariants only; never throw across API boundaries. Fail fast on programmer errors instead of defensive fallbacks that hide bugs.
 
-## Build / lint / test
-- `cmake -B build -S .` then `cmake --build build -j` for builds.
-- `ctest --test-dir build --output-on-failure -j` for tests.
-- `cmake --build build --target lint` for clang-tidy across the tree.
-- A top-level `Makefile` wraps these as `make build` / `make test` / `make lint`
-  to mirror the parent project's commands.
+## Logging
+- spdlog everywhere, through the registry in `logging.hpp`. No `std::cout`/`std::cerr` diagnostics — they bypass levels and routing.
+- Write grep-able key=value fields: `spdlog::info("loaded model fp={} path={}", fp, path)`.
 
-## Proto / gRPC
-- Generated sources live in `${CMAKE_BINARY_DIR}/proto/` (out of source tree).
-- Don't edit generated code. Don't `#include` `.pb.cc` directly. Always
-  `#include "service.pb.h"` or `"worker/worker.grpc.pb.h"`.
-- Wrap raw `grpc::ClientReaderWriter` in our own RAII helper before letting it
-  spread across the codebase — gRPC's C++ API is verbose and we don't want it
-  leaking into business logic.
+## llama.cpp & gRPC
+- llama.cpp is vendored in `third_party/llama.cpp` and linked directly — no bindings layer. `llama_model*`/`llama_context*` are RAII-owned via the custom deleters in `llama_handles.hpp`; define ownership there, once.
+- llama.cpp's `examples/server/` is a pattern source (multi-slot inference, sampling), not a code source — its server has different goals.
+- Proto sources live in `../mass-proto/proto/`; generated code lands in the build tree. Never edit or commit generated code. Wrap raw gRPC streams in RAII helpers before they spread into business logic.
 
-## llama.cpp
-- We link directly against `libllama.a` / `libggml.a` from the vendored
-  `third_party/llama.cpp` submodule. No FFI. No bindings layer.
-- Treat `llama_model*` / `llama_context*` as RAII-owned resources via custom
-  `unique_ptr` deleters. Define them once in `include/mass_worker/llama_handles.hpp`.
-- The reference llama.cpp `examples/server/` is a useful pattern source for
-  things like multi-slot inference, tokenizer use, and sampling. Borrow ideas;
-  don't copy code wholesale (their server has different goals).
+## Build & toolchain
+- `make build` / `make test` / `make lint` / `make format`, mirroring the sibling repos. `make build` auto-picks the GPU backend (Metal on macOS, Vulkan elsewhere); `make build-cuda` configures a separate `build-cuda/` tree so the default tree stays intact.
+- vcpkg resolves through `$VCPKG_ROOT` — a wiped build dir has no cached toolchain path, so keep it set (D:/vcpkg on the dev box).
+- Don't set a project-wide `CMAKE_CXX_STANDARD`: llama.cpp targets its own; our targets request `cxx_std_23` per-target.
+- On Windows the MSVC toolset is pinned in the Makefile (`TOOLSET_PIN`): vcpkg and CMake picking different toolsets after a background VS update produces ABI-incompatible objects that fail link with unresolved STL intrinsics. Bump the pin deliberately, not by accident.
 
-## Don't do
-- No `using namespace std;` in headers, ever; sparingly in narrow scopes in .cpp.
-- No global mutable state. Singletons only via `Meyers's` pattern, and only
-  for genuinely process-singleton concerns (logger registry, llama backend init).
-- No comments restating what the code does. Only WHY: invariant, race window,
-  bug-fix breadcrumb, surprising constraint. If it could be deleted without
-  confusing a careful reader, delete it.
+## Installer & services
+- Every path the installer creates is recorded in `install.record` (written atomically) — it is the uninstaller's source of truth; anything not recorded leaks on uninstall.
+- The UAC elevation relaunch must forward the real action flags and persist wizard state before elevating, or the elevated process re-runs from scratch.
+
+## Conventions
+- Style: RAII for everything resource-shaped, no raw `new`/`delete`; value semantics by default, `const&` when borrowing; `snake_case` functions/variables, `PascalCase` types, `kPascalCase` constants, `trailing_underscore_` members; `.clang-format`/`.clang-tidy` in repo root are the arbiters.
+- Headers in `include/mass_worker/`, sources in `src/`, one `*_test.cpp` per subsystem in `tests/` (GoogleTest; `INSTANTIATE_TEST_SUITE_P` for table-driven cases).
+- Prefer the standard library; a new dependency must earn its place in `vcpkg.json`.
+- Before calling work done, run `make lint` and `make test` and exercise the changed behavior for real; report what you verified and what you couldn't.

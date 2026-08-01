@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -13,7 +14,6 @@
 #include <vector>
 
 #include "ggml-backend.h"
-
 #include "mass_worker/cache.hpp"
 #include "mass_worker/chat_model.hpp"
 #include "mass_worker/embedding_model.hpp"
@@ -22,6 +22,7 @@
 
 // Forward declarations from generated proto.
 namespace mass::v1::worker {
+class HubLoadModel;
 class HubMessage;
 class WorkerMessage;
 class WorkerRegister;
@@ -31,8 +32,41 @@ class WorkerDeviceStats;
 
 namespace mass_worker {
 
+// enabled_placement_ids is the pure decision half of device whitelisting
+// for new model loads: given the operator's enabled set (nullopt = every
+// advertised device) and the advertised hardware shape, it returns the
+// canonical device IDs ("gpu:N" in enumeration order, then "cpu:0") a new
+// load may occupy.
+//
+// CPU is a placement target only when no GPU made the set: llama.cpp
+// treats a listed CPU as a peer target and splits hybrid models across
+// GPU+CPU, collapsing throughput. So CPU appears for default-all on a
+// GPU-less box, or for a whitelist that selects no advertised GPU but
+// explicitly enables "cpu:0".
+//
+// An empty result means NO devices are enabled — callers must fail the
+// load, never fall back to unrestricted placement.
+[[nodiscard]] std::vector<std::string> enabled_placement_ids(
+    const std::optional<std::unordered_set<std::string>>& enabled, int gpu_count, bool has_cpu);
+
+// loaded_model_file_keys extracts the store-relative cache keys backing a
+// HubLoadModel: the ModelFile.filename values (primary + companions),
+// verbatim — filename stays set on loopback local_path entries too. Entries
+// with an empty filename are skipped: filename IS the cache key, so a
+// keyless artifact has no identity to report. Echoed in
+// LoadedModelStatus.files for MASS's cache reconciliation.
+[[nodiscard]] std::vector<std::string> loaded_model_file_keys(
+    const mass::v1::worker::HubLoadModel& req);
+
+// mentions_device_loss matches the spellings a lost GPU device produces
+// across layers — vulkan.hpp exceptions ("ErrorDeviceLost"), the C API
+// ("VK_ERROR_DEVICE_LOST"), and prose ("device lost") — case-insensitive,
+// so the WorkerService::device_lost flag catches the error whichever
+// layer's text reaches the frame.
+[[nodiscard]] bool mentions_device_loss(std::string_view msg);
+
 // kRuntimeName is the wire identifier MASS uses to route this worker to its
-// matching gateway (mass-runtime-llama-cpp). Must match the gateway's
+// matching gateway (mass-runtime-gateway-llama-cpp). Must match the gateway's
 // `runtime_name` and the URL prefix `/mass.llama-cpp.*`.
 inline constexpr std::string_view kRuntimeName = "llama-cpp";
 
@@ -51,7 +85,10 @@ using EmittedFn = std::function<bool(const mass::v1::worker::WorkerMessage&)>;
 // shared_mutex).
 class WorkerService {
 public:
-    WorkerService(std::string id, std::string name, std::string models_dir);
+    // default_vram_headroom_pct is the worker-wide watermark used when a
+    // LoadHints message arrives without an explicit override (1-100).
+    WorkerService(std::string id, std::string name, std::string models_dir,
+                  int32_t default_vram_headroom_pct = 75);
     ~WorkerService();
 
     WorkerService(const WorkerService&) = delete;
@@ -75,55 +112,148 @@ public:
     //
     // The returned WorkerMessage is the terminal frame — exactly one per
     // call: WorkerJobResult (chat/embed/tokenize), WorkerLoadModelResult,
-    // or WorkerUnloadResult. nullptr means "no terminal frame" (used by
-    // fire-and-forget DeleteCacheFiles).
-    [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage>
-    execute(const mass::v1::worker::HubMessage& job, EmittedFn emit);
+    // or WorkerUnloadResult. nullptr means "no terminal frame": the
+    // fire-and-forget messages (CancelJob, DeleteCacheFiles,
+    // SetEnabledDevices) and malformed HubMessages with no msg case,
+    // which carry no job_id a frame could be routed by (logged + dropped).
+    //
+    // Never throws: llama/ggml raise runtime failures (device OOM during
+    // a load or decode) as C++ exceptions, and execute runs on worker
+    // threads where an escaping throw is std::terminate. Exceptions are
+    // folded into the message kind's error frame.
+    [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage> execute(
+        const mass::v1::worker::HubMessage& job, EmittedFn emit);
 
     void delete_cache_files(const std::vector<std::string>& filenames);
 
     // Replace the in-memory whitelist of devices allowed for new model
-    // loads. Empty list = "all enabled" (the default state on first
-    // connect, before MASS sends its post-Register snapshot). Already-
-    // loaded models are unaffected.
-    void set_enabled_devices(std::vector<std::string> ids);
+    // loads. nullopt = every advertised device enabled (HubSetEnabledDevices
+    // all=true, and the default state on first connect before MASS sends its
+    // post-Register snapshot). A value = exactly that set; an EMPTY value =
+    // no devices enabled, new loads are rejected. Already-loaded models are
+    // unaffected.
+    void set_enabled_devices(std::optional<std::vector<std::string>> ids);
 
+    // device_lost turns true when a job or load error mentions a lost GPU
+    // device (VK_ERROR_DEVICE_LOST and friends). It never resets: after a
+    // device loss every llama call on that device throws, including
+    // llama_free inside llama.cpp's noexcept destructors — an uncatchable
+    // SIGABRT the moment a model unloads. The runner watches this flag and
+    // exits the process (skipping those destructors) right after the
+    // error frame is on the wire, so systemd restarts with a fresh Vulkan
+    // instance instead of coredumping on the next idle eviction.
+    [[nodiscard]] bool device_lost() const noexcept {
+        return device_lost_.load(std::memory_order_relaxed);
+    }
+
+    // request_stop flips the service into stopping mode: every in-flight
+    // job's cancel poll fires (generation aborts at the next sampler step,
+    // batch jobs at the next chunk) and pending model fetches abort. Safe to
+    // call from any thread; atomics only, no locks or logging — the runner's
+    // watcher invokes it the moment a stop is requested, BEFORE the job
+    // threads are joined, so the SCM's stop budget is never blown by an
+    // in-flight generation.
+    void request_stop();
+
+    // shutdown stops (request_stop) and releases the loaded models. Called
+    // once, after the job threads have drained.
     void shutdown();
 
 private:
+    [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage> execute_impl(
+        const mass::v1::worker::HubMessage& job, EmittedFn emit);
+
+    std::atomic<bool> device_lost_{false};
+
     const std::string id_;
     const std::string name_;
     const std::string models_dir_;
+    const int32_t default_vram_headroom_pct_;
 
     Hardware hardware_;
-    Cache    cache_;
-    Fetcher  fetcher_;
+    Cache cache_;
+    Fetcher fetcher_;
 
     // Loaded models keyed by gateway-supplied model_id. The id is opaque to
     // MASS; we treat it as the dedup key — same model file + load hints =
     // same id = single load.
     mutable std::shared_mutex models_mu_;
-    std::unordered_map<std::string, std::shared_ptr<ChatModel>>      chat_models_;
+    std::unordered_map<std::string, std::shared_ptr<ChatModel>> chat_models_;
     std::unordered_map<std::string, std::shared_ptr<EmbeddingModel>> embed_models_;
+
+    // Store-relative cache keys backing each loaded model (the
+    // ModelFile.filename values echoed from HubLoadModel), reported via
+    // LoadedModelStatus.files in every heartbeat. Guarded by models_mu_
+    // and kept in lockstep with the model maps: recorded on load, erased
+    // on unload and shutdown, so an entry can never outlive its model.
+    std::unordered_map<std::string, std::vector<std::string>> model_files_;
 
     // Live count of in-flight jobs per model_id. Used to derive
     // available_capacity in heartbeats and active-jobs in loaded_models.
-    mutable std::mutex                          active_mu_;
-    std::unordered_map<std::string, int32_t>    active_per_model_;
-    std::atomic<int32_t>                        active_total_{0};
+    mutable std::mutex active_mu_;
+    std::unordered_map<std::string, int32_t> active_per_model_;
+    std::atomic<int32_t> active_total_{0};
 
-    // Operator-controlled device whitelist. nullopt = "all advertised
-    // devices enabled" (bootstrap state before MASS sends a post-Register
-    // snapshot). Consulted at model-load time only.
-    mutable std::shared_mutex                              enabled_mu_;
-    std::optional<std::unordered_set<std::string>>         enabled_devices_;
+    // Operator-controlled device whitelist. nullopt means "all
+    // advertised devices enabled" — the bootstrap state before MASS
+    // sends a post-Register snapshot, and the all=true wire state. An
+    // empty set means NO devices are enabled (new loads are rejected).
+    // Consulted at model-load time only.
+    mutable std::shared_mutex enabled_mu_;
+    std::optional<std::unordered_set<std::string>> enabled_devices_;
 
     std::atomic<bool> fetch_cancel_{false};
 
+    // Set by request_stop()/shutdown(). ORed into every job's IsCancelledFn
+    // so a worker stop cancels in-flight generation instead of letting it
+    // run to max_tokens.
+    std::atomic<bool> stopping_{false};
+
+    // Per-job cancellation requests from MASS via HubCancelJob, keyed by
+    // job_id with the arrival time. chat_completion_stream polls
+    // is_job_cancel_requested() between sampler steps; on cancel it exits
+    // with ModelErrorCode::Cancelled and execute() emits the terminal
+    // "cancelled by operator" frame.
+    //
+    // Entries are added by execute()'s kCancelJob handler and erased by
+    // clear_job_cancel() when the matching job's execute() path finishes.
+    // A cancel with no matching job (already completed, or never
+    // dispatched) has nothing to erase it, so request_job_cancel() sweeps
+    // entries older than kCancelRetention and enforces kMaxPendingCancels,
+    // keeping the map bounded no matter what MASS sends.
+    mutable std::mutex job_cancel_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> cancel_requested_;
+
+    // is_job_cancel_requested returns true iff a HubCancelJob has arrived
+    // for job_id and no completion has cleared it yet.
+    [[nodiscard]] bool is_job_cancel_requested(const std::string& job_id) const;
+
+    // request_job_cancel marks job_id as cancel-requested and sweeps
+    // expired/excess entries. Idempotent: re-sending HubCancelJob keeps the
+    // original arrival time.
+    void request_job_cancel(const std::string& job_id);
+
+    // clear_job_cancel removes job_id from the cancel-requested map; called
+    // when the job's execute() path completes (matched or not).
+    void clear_job_cancel(const std::string& job_id);
+
+    // Paired result of allowed_load_devices(): the ggml-backend device
+    // pointers handed to mparams.devices, alongside their canonical IDs
+    // ("gpu:N" / "cpu:0") for emission on heartbeat. When the operator
+    // hasn't restricted anything, devices is empty (signal to llama.cpp
+    // = "use everything") while ids enumerates the full placement set.
+    // An empty ids list means NO devices are enabled — the load must be
+    // rejected, never fall through to unrestricted placement.
+    struct AllowedDevices {
+        std::vector<ggml_backend_dev_t> devices;
+        std::vector<std::string> ids;
+    };
+
     // Build the ggml device whitelist for model loads given current
-    // enabled state. Empty result == nullopt enabled set (default = all);
-    // otherwise the worker's hardware list filtered by the enabled set.
-    [[nodiscard]] std::vector<ggml_backend_dev_t> allowed_load_devices() const;
+    // enabled state, plus the canonical IDs MASS scores against. The
+    // enabled-set → placement decision lives in enabled_placement_ids;
+    // this maps the surviving IDs back to backend device pointers.
+    [[nodiscard]] AllowedDevices allowed_load_devices() const;
 };
 
 }  // namespace mass_worker

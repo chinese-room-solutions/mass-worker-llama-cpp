@@ -22,14 +22,14 @@ public:
     // `loaded_paths` are silently skipped — defence in depth against MASS
     // requesting a delete of a file backing a loaded model. Empty parent
     // directories are pruned up to (but not including) models_dir.
-    void delete_files(const std::vector<std::string>&                 filenames,
+    void delete_files(const std::vector<std::string>& filenames,
                       const std::unordered_set<std::filesystem::path>& loaded_paths) const;
 
     // For tests: resolve a wire-format relative filename to an absolute path
     // under models_dir, rejecting traversal ("..", absolute paths). Returns
     // nullopt iff the input would escape models_dir.
-    [[nodiscard]] std::optional<std::filesystem::path>
-    safe_cache_path(const std::string& rel) const;
+    [[nodiscard]] std::optional<std::filesystem::path> safe_cache_path(
+        const std::string& rel) const;
 
     [[nodiscard]] const std::filesystem::path& models_dir() const { return models_dir_; }
 

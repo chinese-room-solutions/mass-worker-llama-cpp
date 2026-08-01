@@ -1,93 +1,113 @@
 name: CI
 
+# CI runs on the self-hosted Linux runner (16-core, 32GB, real Vulkan device)
+# — no billed minutes, persistent local caches, so even cold builds are cheap.
+# macOS/Metal is compiled by release.yml on its own self-hosted runner;
+# the Windows leg there is parked until a self-hosted Windows runner exists.
+# Optional extra Debug leg (catches UB/asserts):
+#   build_type: [Release, Debug]
+
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
-
-# Cancel in-flight runs on the same branch when a new commit is pushed.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: ${{ matrix.os }} / ${{ matrix.build_type }}
-    runs-on: ${{ matrix.os }}
+    name: self-hosted linux / ${{ matrix.build_type }}
+    runs-on: [self-hosted, Linux, X64]
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         build_type: [Release]
-        include:
-          # Linux also runs Debug to catch UB / sanitiser issues earlier.
-          - os: ubuntu-latest
-            build_type: Debug
 
     env:
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      # Pinned vcpkg commit — deterministic dep versions.
+      VCPKG_COMMIT: 59acc80b235ac2a9457cc8b8c0fddfb9551019a6
       # mass-proto sibling repo — checked out next to mass-worker-llama-cpp
       # via the second actions/checkout step below.
       MASS_PROTO_DIR: ${{ github.workspace }}/mass-proto
 
     steps:
       - name: Checkout mass-worker-llama-cpp
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
           path: mass-worker-llama-cpp
 
       - name: Checkout mass-proto (sibling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: chinese-room-solutions/mass-proto
+          token: ${{ secrets.GH_PAT }}
           path: mass-proto
 
-      - name: Set up vcpkg cache (GitHub Actions)
-        # Lets vcpkg reuse compiled binaries across CI runs via the gha cache.
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
+      # Self-hosted: caches live on the runner's own disk — no actions/cache
+      # round-trips, no 10GB repo cap, no 7-day eviction. ccache is picked up
+      # automatically by the project's CMakeLists compiler-launcher probe.
+      - name: Point caches at persistent local dirs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ninja-build pkg-config autoconf automake libtool curl zip unzip tar
+          mkdir -p "$HOME/.cache/mass-worker/vcpkg-binaries" "$HOME/.cache/mass-worker/ccache"
+          {
+            echo "VCPKG_BINARY_SOURCES=clear;files,$HOME/.cache/mass-worker/vcpkg-binaries,readwrite"
+            echo "CCACHE_DIR=$HOME/.cache/mass-worker/ccache"
+            echo "CCACHE_MAXSIZE=10G"
+          } >> "$GITHUB_ENV"
 
-      - name: Install macOS build deps
-        if: runner.os == 'macOS'
-        run: brew install ninja autoconf automake libtool
-
-      - name: Install Windows build deps
-        if: runner.os == 'Windows'
-        run: choco install -y ninja
-
-      - name: Bootstrap vcpkg
-        shell: bash
+      - name: Bootstrap vcpkg (persistent)
+        env:
+          # Hide the user's ~/.gitconfig from vcpkg's git: its https->ssh
+          # insteadOf rewrite pushes promisor fetches onto SSH, where GitHub's
+          # connection-rate throttle resets them. Step-scoped because
+          # actions/checkout must WRITE global config and fails on /dev/null.
+          GIT_CONFIG_GLOBAL: /dev/null
         run: |
-          git clone https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
-          else
-            "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          # Persistent treeless clone: vcpkg resolves the manifest's
+          # builtin-baseline and port trees via `git show`, lazily fetching
+          # missing objects. Keeping the clone (and thus every fetched object
+          # plus the bootstrapped tool) across runs means a warm run needs no
+          # vcpkg-side network at all. RUNNER_TEMP would be wiped per run.
+          V="$HOME/.cache/mass-worker/vcpkg"
+          if [ ! -d "$V/.git" ]; then
+            git clone --filter=tree:0 --no-checkout https://github.com/microsoft/vcpkg "$V"
           fi
-          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+          git -C "$V" rev-parse --verify -q "$VCPKG_COMMIT^{commit}" >/dev/null || git -C "$V" fetch origin
+          git -C "$V" checkout -f "$VCPKG_COMMIT"
+          "$V/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$V" >> "$GITHUB_ENV"
 
+      # CI mirrors the release Linux leg (Vulkan backend) so a backend compile
+      # break is caught here; Metal is only compiled at release time on macOS.
       - name: Configure
         working-directory: mass-worker-llama-cpp
-        shell: bash
+        env:
+          # vcpkg install runs inside configure and lazily git-fetches port
+          # trees — same insteadOf hazard as the bootstrap step.
+          GIT_CONFIG_GLOBAL: /dev/null
         run: |
+          # Release-only triplet: the default builds every dependency twice
+          # (debug+release), which doubles vcpkg time and peak disk/RAM.
+          # Host triplet must match or vcpkg treats the build as cross and
+          # compiles the grpc/protobuf host tools a second time. Deps stay
+          # release even on a Debug app build — fine on Linux (no CRT split).
           cmake -B build -S . \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-linux-release \
+            -DVCPKG_HOST_TRIPLET=x64-linux-release \
+            -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build \
             -DMASS_PROTO_DIR="$MASS_PROTO_DIR" \
+            -DMASS_WORKER_LLAMA_VULKAN=ON \
+            -DMASS_WORKER_LLAMA_METAL=OFF \
+            -DMASS_WORKER_LLAMA_CUDA=OFF \
             -DMASS_WORKER_WERROR=ON
 
       - name: Build
@@ -100,9 +120,9 @@ jobs:
 
       - name: Upload build log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: build-log-${{ matrix.os }}-${{ matrix.build_type }}
+          name: build-log-self-hosted-${{ matrix.build_type }}
           path: |
             mass-worker-llama-cpp/build/CMakeFiles/CMakeOutput.log
             mass-worker-llama-cpp/build/CMakeFiles/CMakeError.log

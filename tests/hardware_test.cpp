@@ -1,8 +1,8 @@
+#include "mass_worker/hardware.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
-
-#include "mass_worker/hardware.hpp"
 
 namespace {
 
@@ -10,7 +10,7 @@ TEST(HardwareTest, AlwaysReportsCpuFirst) {
     mass_worker::Hardware hw;
     const auto& devs = hw.devices();
     ASSERT_FALSE(devs.empty());
-    EXPECT_EQ(devs[0].id,   "cpu:0");
+    EXPECT_EQ(devs[0].id, "cpu:0");
     EXPECT_EQ(devs[0].type, mass_worker::DeviceType::Cpu);
     EXPECT_GT(devs[0].total_memory_mb, 0);
 }
@@ -36,9 +36,9 @@ TEST(HardwareTest, StatsMatchDeviceList) {
     // Stat IDs should match the device list 1:1, in order.
     for (std::size_t i = 0; i < stats.size(); ++i) {
         EXPECT_EQ(stats[i].id, hw.devices()[i].id);
-        EXPECT_GE(stats[i].used_memory_mb,  0);
+        EXPECT_GE(stats[i].used_memory_mb, 0);
         EXPECT_GE(stats[i].total_memory_mb, 0);
-        EXPECT_LE(stats[i].used_memory_mb,  stats[i].total_memory_mb);
+        EXPECT_LE(stats[i].used_memory_mb, stats[i].total_memory_mb);
     }
 }
 

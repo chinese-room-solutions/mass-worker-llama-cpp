@@ -1,0 +1,8 @@
+---
+# gtest's ASSERT_* macros hide their early return behind an opaque
+# AssertionResult, so the optional-access analysis cannot see the guard
+# and flags every ASSERT_TRUE(x.has_value()) → x->field sequence. In
+# test code that pattern is the point — suppressed here, live in src/
+# and include/.
+InheritParentConfig: true
+Checks: '-bugprone-unchecked-optional-access'

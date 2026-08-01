@@ -9,4 +9,17 @@ namespace mass_worker {
 // Go worker's behaviour.
 void init_llama_backend_once();
 
+// LlamaLogQuietScope demotes llama.cpp/ggml ERROR-level log lines to DEBUG on
+// the current thread for its lifetime. Used to wrap operations that are
+// *expected* to fail as a normal control-flow signal — e.g. the embedding
+// context pool growing until an allocation OOMs — so a successful capacity
+// probe doesn't surface scary error lines. Reentrant; restores on destruction.
+class LlamaLogQuietScope {
+public:
+    LlamaLogQuietScope();
+    ~LlamaLogQuietScope();
+    LlamaLogQuietScope(const LlamaLogQuietScope&) = delete;
+    LlamaLogQuietScope& operator=(const LlamaLogQuietScope&) = delete;
+};
+
 }  // namespace mass_worker

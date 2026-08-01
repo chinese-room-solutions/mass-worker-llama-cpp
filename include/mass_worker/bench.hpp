@@ -1,17 +1,31 @@
 #pragma once
 
-#include <optional>
+#include <cstdint>
+#include <expected>
 #include <string>
-#include <vector>
 
 namespace mass_worker {
 
 // Per-device benchmark numbers in MASS's wire format.
 struct BenchResult {
-    std::string device_id;     // canonical "cpu:0" / "gpu:N"
+    std::string device_id;  // canonical "cpu:0" / "gpu:N"
     std::string device_name;
-    double      memory_gbs{0};       // GB/s memory bandwidth
-    double      compute_gflops{0};   // GFLOPS Q4_K matmul throughput
+    double memory_gbs{0};      // GB/s in-device memory bandwidth (STREAM-style)
+    double compute_gflops{0};  // GFLOPS Q4_K matmul throughput
+    double load_gbs{0};        // GB/s host→device upload throughput (model-load proxy)
+};
+
+// Errors from the benchmark layer. A bench that can't run is an error, never
+// a 0.0 measurement — MASS must be able to tell "slow device" from "couldn't
+// measure".
+enum class BenchErrorCode : std::uint8_t {
+    UnknownDevice,      // ID not in the hardware enumeration / ggml registry
+    BackendInitFailed,  // ggml_backend_dev_init failed
+    AllocFailed,        // graph/tensor buffer allocation failed (e.g. OOM)
+};
+struct BenchError {
+    BenchErrorCode code;
+    std::string message;
 };
 
 // Hardware is needed to enumerate devices and to look up name + canonical
@@ -19,13 +33,9 @@ struct BenchResult {
 class Hardware;
 
 // Run a single device's benchmark. Resolves the device by canonical ID
-// ("cpu:0" or "gpu:N"). Returns nullopt if the ID isn't known to the
-// host's hardware enumeration.
-[[nodiscard]] std::optional<BenchResult>
-bench_one(const Hardware& hardware, const std::string& device_id);
-
-// Bench every device the host knows about. Same shape as bench_one but
-// fans out across all enumerated devices.
-[[nodiscard]] std::vector<BenchResult> bench_all(const Hardware& hardware);
+// ("cpu:0" or "gpu:N"). Callers benching several devices run this per device
+// and report partial results — one failing device must not discard the rest.
+[[nodiscard]] std::expected<BenchResult, BenchError> bench_one(const Hardware& hardware,
+                                                               const std::string& device_id);
 
 }  // namespace mass_worker

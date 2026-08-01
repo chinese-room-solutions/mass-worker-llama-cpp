@@ -3,12 +3,14 @@
   "version-string": "0.1.0",
   "description": "MASS worker — llama.cpp inference runtime, native C++ implementation",
   "homepage": "https://github.com/chinese-room-solutions/mass-worker-llama-cpp",
+  "builtin-baseline": "031f4afe03be385aee354f15be6e6b1fe57497c7",
   "dependencies": [
     "grpc",
     "protobuf",
     "spdlog",
     "cli11",
     "gtest",
+    "zstd",
     {
       "name": "curl",
       "default-features": false,

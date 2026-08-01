@@ -1,10 +1,11 @@
 #include "mass_worker/cache.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 #include <system_error>
-
-#include <spdlog/spdlog.h>
 
 namespace mass_worker {
 
@@ -16,9 +17,9 @@ bool ext_is_gguf(const fs::path& p) {
     auto e = p.extension().string();
     if (e.size() != 5 || e[0] != '.') return false;
     // Case-insensitive match for ".gguf".
-    static constexpr char want[] = {'g', 'g', 'u', 'f'};
-    for (size_t i = 0; i < 4; ++i) {
-        if (std::tolower(static_cast<unsigned char>(e[i + 1])) != want[i]) return false;
+    static constexpr std::string_view kWant = "gguf";
+    for (size_t i = 0; i < kWant.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(e[i + 1])) != kWant.at(i)) return false;
     }
     return true;
 }
@@ -36,8 +37,7 @@ std::vector<std::string> Cache::list_gguf() const {
         return out;
     }
 
-    fs::recursive_directory_iterator it(models_dir_,
-                                        fs::directory_options::skip_permission_denied,
+    fs::recursive_directory_iterator it(models_dir_, fs::directory_options::skip_permission_denied,
                                         ec);
     if (ec) {
         spdlog::warn("walking models_dir {} failed: {}", models_dir_.string(), ec.message());
@@ -67,12 +67,16 @@ std::optional<fs::path> Cache::safe_cache_path(const std::string& rel) const {
     if (rel.empty()) return std::nullopt;
 
     std::string s = rel;
-    std::replace(s.begin(), s.end(), '\\', '/');
+    std::ranges::replace(s, '\\', '/');
     // Strip leading slashes — the wire format is relative, but be defensive.
     size_t i = 0;
     while (i < s.size() && s[i] == '/') ++i;
     s.erase(0, i);
     if (s.empty()) return std::nullopt;
+
+    // ':' enables Windows drive-relative ("C:evil") and NTFS alternate data
+    // stream escapes — see Fetcher::safe_rel_filename in fetch.cpp.
+    if (s.find(':') != std::string::npos) return std::nullopt;
 
     fs::path p(s);
     p = p.lexically_normal();
@@ -84,8 +88,8 @@ std::optional<fs::path> Cache::safe_cache_path(const std::string& rel) const {
     return models_dir_ / p;
 }
 
-void Cache::delete_files(const std::vector<std::string>&                  filenames,
-                         const std::unordered_set<fs::path>&              loaded_paths) const {
+void Cache::delete_files(const std::vector<std::string>& filenames,
+                         const std::unordered_set<fs::path>& loaded_paths) const {
     if (filenames.empty() || models_dir_.empty()) return;
 
     for (const auto& rel : filenames) {
@@ -95,8 +99,7 @@ void Cache::delete_files(const std::vector<std::string>&                  filena
             continue;
         }
         if (loaded_paths.contains(*abs)) {
-            spdlog::debug("skipping delete: file is part of a loaded model: {}",
-                          abs->string());
+            spdlog::debug("skipping delete: file is part of a loaded model: {}", abs->string());
             continue;
         }
 

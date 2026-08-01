@@ -12,6 +12,7 @@
 namespace mass_worker {
 
 struct LlamaModelDeleter {
+    // NOLINTNEXTLINE(readability-non-const-parameter) — the free fn takes non-const
     void operator()(llama_model* m) const noexcept {
         if (m) llama_model_free(m);
     }
@@ -19,6 +20,7 @@ struct LlamaModelDeleter {
 using LlamaModelPtr = std::unique_ptr<llama_model, LlamaModelDeleter>;
 
 struct LlamaContextDeleter {
+    // NOLINTNEXTLINE(readability-non-const-parameter) — the free fn takes non-const
     void operator()(llama_context* c) const noexcept {
         if (c) llama_free(c);
     }
@@ -26,6 +28,7 @@ struct LlamaContextDeleter {
 using LlamaContextPtr = std::unique_ptr<llama_context, LlamaContextDeleter>;
 
 struct LlamaSamplerDeleter {
+    // NOLINTNEXTLINE(readability-non-const-parameter) — the free fn takes non-const
     void operator()(llama_sampler* s) const noexcept {
         if (s) llama_sampler_free(s);
     }

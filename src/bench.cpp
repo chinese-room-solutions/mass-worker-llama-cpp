@@ -1,18 +1,19 @@
 #include "mass_worker/bench.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <expected>
 #include <thread>
 #include <vector>
-
-#include <spdlog/spdlog.h>
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
-
 #include "mass_worker/hardware.hpp"
 
 namespace mass_worker {
@@ -22,17 +23,23 @@ namespace {
 // RAII wrappers for the C handles. Define-at-call-site is fine — these don't
 // escape function scope.
 struct GgmlBackendDeleter {
-    void operator()(ggml_backend* p) const noexcept { if (p) ggml_backend_free(p); }
+    void operator()(ggml_backend* p) const noexcept {
+        if (p) ggml_backend_free(p);
+    }
 };
 using BackendPtr = std::unique_ptr<ggml_backend, GgmlBackendDeleter>;
 
 struct GgmlContextDeleter {
-    void operator()(ggml_context* p) const noexcept { if (p) ggml_free(p); }
+    void operator()(ggml_context* p) const noexcept {
+        if (p) ggml_free(p);
+    }
 };
 using ContextPtr = std::unique_ptr<ggml_context, GgmlContextDeleter>;
 
 struct GgmlBufferDeleter {
-    void operator()(ggml_backend_buffer* p) const noexcept { if (p) ggml_backend_buffer_free(p); }
+    void operator()(ggml_backend_buffer* p) const noexcept {
+        if (p) ggml_backend_buffer_free(p);
+    }
 };
 using BufferPtr = std::unique_ptr<ggml_backend_buffer, GgmlBufferDeleter>;
 
@@ -51,14 +58,13 @@ ggml_backend_dev_t resolve_device(const std::string& device_id) {
         return nullptr;
     }
     if (device_id.starts_with("gpu:")) {
-        const int wanted = std::atoi(device_id.c_str() + 4);
+        const int wanted = static_cast<int>(std::strtol(device_id.c_str() + 4, nullptr, 10));
         int seen = 0;
         for (std::size_t i = 0; i < n; ++i) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
             if (!d) continue;
             const auto t = ggml_backend_dev_type(d);
-            if (t != GGML_BACKEND_DEVICE_TYPE_GPU &&
-                t != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 continue;
             }
             if (seen == wanted) return d;
@@ -75,35 +81,40 @@ BackendPtr init_backend(ggml_backend_dev_t dev) {
     if (!backend) return nullptr;
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
         const auto threads = std::thread::hardware_concurrency();
-        ggml_backend_cpu_set_n_threads(backend.get(),
-                                       static_cast<int>(threads ? threads : 1u));
+        ggml_backend_cpu_set_n_threads(backend.get(), static_cast<int>(threads ? threads : 1u));
     }
     return backend;
 }
 
 double median(std::vector<double> v) {
-    std::sort(v.begin(), v.end());
+    std::ranges::sort(v);
     return v[v.size() / 2];
 }
 
 // --- Bandwidth: ggml_add of two large F32 tensors. 3× tensor_bytes per iter
 //     (2 reads + 1 write). Reports peak achievable memory bandwidth in GB/s.
-double bench_bandwidth(ggml_backend_dev_t dev) {
-    constexpr int64_t n_elements = 64LL * 1024 * 1024;  // 256 MB / tensor
+std::expected<double, BenchError> bench_bandwidth(ggml_backend_dev_t dev) {
+    constexpr int64_t kNElements = 64LL * 1024 * 1024;  // 256 MB / tensor
 
     auto backend = init_backend(dev);
-    if (!backend) return 0;
+    if (!backend) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::BackendInitFailed, "bandwidth: backend init failed"});
+    }
 
-    const std::size_t mem = ggml_tensor_overhead() * 4 + ggml_graph_overhead();
+    const std::size_t mem = (ggml_tensor_overhead() * 4) + ggml_graph_overhead();
     ContextPtr ctx(ggml_init(ggml_init_params{
         /*.mem_size   = */ mem,
         /*.mem_buffer = */ nullptr,
         /*.no_alloc   = */ true,
     }));
-    if (!ctx) return 0;
+    if (!ctx) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::AllocFailed, "bandwidth: ggml_init failed"});
+    }
 
-    auto* a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_elements);
-    auto* b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_elements);
+    auto* a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, kNElements);
+    auto* b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, kNElements);
     auto* c = ggml_add(ctx.get(), a, b);
 
     auto* graph = ggml_new_graph(ctx.get());
@@ -111,10 +122,13 @@ double bench_bandwidth(ggml_backend_dev_t dev) {
 
     BufferPtr buf(ggml_backend_alloc_ctx_tensors_from_buft(
         ctx.get(), ggml_backend_get_default_buffer_type(backend.get())));
-    if (!buf) return 0;
+    if (!buf) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::AllocFailed, "bandwidth: tensor buffer allocation failed"});
+    }
 
     const std::size_t tensor_bytes = ggml_nbytes(a);
-    std::vector<float> ones(static_cast<std::size_t>(n_elements), 1.0f);
+    std::vector<float> ones(static_cast<std::size_t>(kNElements), 1.0f);
     ggml_backend_tensor_set(a, ones.data(), 0, tensor_bytes);
     ggml_backend_tensor_set(b, ones.data(), 0, tensor_bytes);
     ggml_backend_synchronize(backend.get());
@@ -140,58 +154,125 @@ double bench_bandwidth(ggml_backend_dev_t dev) {
     return median(std::move(samples));
 }
 
-// --- Q4_K matmul: 32 chained matmuls (simulating an LLM forward pass) of an
-//     8192×8192 weight against a 8192×1 activation. Reports GFLOPS — directly
-//     comparable across CPU + GPU.
-double bench_q4k_matvec(ggml_backend_dev_t dev) {
-    constexpr int64_t M        = 8192;
-    constexpr int64_t K        = 8192;
-    constexpr int64_t N        = 1;
-    constexpr int     n_layers = 32;
+// Host→device upload bandwidth: allocate a 256 MB tensor on the device
+// buffer type, then time ggml_backend_tensor_set across a host-resident
+// F32 buffer. Reports GB/s — the rate at which bytes leave host RAM
+// and land in the device's buffer. This is the dominant cost when MASS
+// switches a worker between two models that don't fit in VRAM
+// simultaneously: disk → mmap → PCIe upload. We measure the PCIe leg
+// (or, for CPU backends, the memcpy leg) directly; the disk-read leg
+// overlaps with it in practice and is bounded above by storage
+// throughput, so reporting just the upload rate gives MASS a defensible
+// lower bound for the dominant transfer.
+std::expected<double, BenchError> bench_load_bandwidth(ggml_backend_dev_t dev) {
+    constexpr int64_t kNElements = 64LL * 1024 * 1024;  // 256 MB tensor
 
     auto backend = init_backend(dev);
-    if (!backend) return 0;
+    if (!backend) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::BackendInitFailed, "load: backend init failed"});
+    }
 
-    const std::size_t mem = ggml_tensor_overhead() * (2 * n_layers + 2) +
-                            ggml_graph_overhead();
+    const std::size_t mem = ggml_tensor_overhead() + ggml_graph_overhead();
     ContextPtr ctx(ggml_init(ggml_init_params{
         /*.mem_size   = */ mem,
         /*.mem_buffer = */ nullptr,
         /*.no_alloc   = */ true,
     }));
-    if (!ctx) return 0;
+    if (!ctx) {
+        return std::unexpected(BenchError{BenchErrorCode::AllocFailed, "load: ggml_init failed"});
+    }
 
-    std::vector<ggml_tensor*> weights(n_layers, nullptr);
-    auto* x0 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, K, N);
+    auto* a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, kNElements);
+    BufferPtr buf(ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx.get(), ggml_backend_get_default_buffer_type(backend.get())));
+    if (!buf) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::AllocFailed, "load: tensor buffer allocation failed"});
+    }
+
+    const std::size_t tensor_bytes = ggml_nbytes(a);
+    std::vector<float> src(static_cast<std::size_t>(kNElements), 1.0f);
+
+    // Warm up to take page-fault / first-touch costs out of the measurement.
+    for (int i = 0; i < 3; ++i) {
+        ggml_backend_tensor_set(a, src.data(), 0, tensor_bytes);
+        ggml_backend_synchronize(backend.get());
+    }
+
+    constexpr int kIters = 21;
+    std::vector<double> samples;
+    samples.reserve(kIters);
+    for (int i = 0; i < kIters; ++i) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        ggml_backend_tensor_set(a, src.data(), 0, tensor_bytes);
+        ggml_backend_synchronize(backend.get());
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        samples.push_back(secs > 0 ? static_cast<double>(tensor_bytes) / secs / 1e9 : 0);
+    }
+    return median(std::move(samples));
+}
+
+// --- Q4_K matmul: 32 chained matmuls (simulating an LLM forward pass) of an
+//     8192×8192 weight against a 8192×1 activation. Reports GFLOPS — directly
+//     comparable across CPU + GPU.
+std::expected<double, BenchError> bench_q4k_matvec(ggml_backend_dev_t dev) {
+    constexpr int64_t kM = 8192;
+    constexpr int64_t kK = 8192;
+    constexpr int64_t kN = 1;
+    constexpr std::size_t kNLayers = 32;
+
+    auto backend = init_backend(dev);
+    if (!backend) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::BackendInitFailed, "compute: backend init failed"});
+    }
+
+    const std::size_t mem = (ggml_tensor_overhead() * (2 * kNLayers + 2)) + ggml_graph_overhead();
+    ContextPtr ctx(ggml_init(ggml_init_params{
+        /*.mem_size   = */ mem,
+        /*.mem_buffer = */ nullptr,
+        /*.no_alloc   = */ true,
+    }));
+    if (!ctx) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::AllocFailed, "compute: ggml_init failed"});
+    }
+
+    std::vector<ggml_tensor*> weights(kNLayers, nullptr);
+    auto* x0 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, kK, kN);
     ggml_tensor* x = x0;
-    for (int i = 0; i < n_layers; ++i) {
-        weights[i] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q4_K, K, M);
+    for (std::size_t i = 0; i < kNLayers; ++i) {
+        weights[i] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q4_K, kK, kM);
         x = ggml_mul_mat(ctx.get(), weights[i], x);
     }
 
-    auto* graph = ggml_new_graph_custom(ctx.get(), 2 * n_layers + 1, false);
+    auto* graph = ggml_new_graph_custom(ctx.get(), (2 * kNLayers) + 1, false);
     ggml_build_forward_expand(graph, x);
 
     BufferPtr buf(ggml_backend_alloc_ctx_tensors_from_buft(
         ctx.get(), ggml_backend_get_default_buffer_type(backend.get())));
-    if (!buf) return 0;
+    if (!buf) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::AllocFailed, "compute: tensor buffer allocation failed"});
+    }
 
     // Quantise one M×K F32 buffer into Q4_K, then reuse for every layer.
     {
-        std::vector<float> src(static_cast<std::size_t>(M * K));
+        std::vector<float> src(static_cast<std::size_t>(kM * kK));
         for (std::size_t i = 0; i < src.size(); ++i) {
-            src[i] = 0.5f - static_cast<float>(i % 1000) / 1000.0f;
+            src[i] = 0.5f - (static_cast<float>(i % 1000) / 1000.0f);
         }
         const std::size_t w_bytes = ggml_nbytes(weights[0]);
         std::vector<std::uint8_t> q4(w_bytes);
-        ggml_quantize_chunk(GGML_TYPE_Q4_K, src.data(), q4.data(),
-                            0, M, K, nullptr);
-        for (int i = 0; i < n_layers; ++i) {
+        ggml_quantize_chunk(GGML_TYPE_Q4_K, src.data(), q4.data(), 0, kM, kK, nullptr);
+        for (std::size_t i = 0; i < kNLayers; ++i) {
             ggml_backend_tensor_set(weights[i], q4.data(), 0, w_bytes);
         }
     }
     {
-        std::vector<float> host_x(static_cast<std::size_t>(K * N), 1.0f);
+        std::vector<float> host_x(static_cast<std::size_t>(kK * kN), 1.0f);
         ggml_backend_tensor_set(x0, host_x.data(), 0, ggml_nbytes(x0));
     }
     ggml_backend_synchronize(backend.get());
@@ -202,16 +283,16 @@ double bench_q4k_matvec(ggml_backend_dev_t dev) {
         ggml_backend_synchronize(backend.get());
     }
 
-    constexpr int reps_per_sample = 10;
-    constexpr int n_samples       = 21;
-    const double  flops_per_graph = static_cast<double>(n_layers) * 2.0 * M * K * N;
-    const double  total_flops     = flops_per_graph * reps_per_sample;
+    constexpr int kRepsPerSample = 10;
+    constexpr int kNSamples = 21;
+    const double flops_per_graph = static_cast<double>(kNLayers) * 2.0 * kM * kK * kN;
+    const double total_flops = flops_per_graph * kRepsPerSample;
 
     std::vector<double> samples;
-    samples.reserve(n_samples);
-    for (int i = 0; i < n_samples; ++i) {
+    samples.reserve(kNSamples);
+    for (int i = 0; i < kNSamples; ++i) {
         const auto t0 = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < reps_per_sample; ++r) {
+        for (int r = 0; r < kRepsPerSample; ++r) {
             ggml_backend_graph_compute(backend.get(), graph);
         }
         ggml_backend_synchronize(backend.get());
@@ -224,38 +305,46 @@ double bench_q4k_matvec(ggml_backend_dev_t dev) {
 
 }  // namespace
 
-std::optional<BenchResult> bench_one(const Hardware& hardware,
-                                     const std::string& device_id) {
+std::expected<BenchResult, BenchError> bench_one(const Hardware& hardware,
+                                                 const std::string& device_id) {
     // Look up the canonical name from Hardware so the reply matches what
     // the worker reported in WorkerRegister.
     const Device* dev_info = nullptr;
     for (const auto& d : hardware.devices()) {
-        if (d.id == device_id) { dev_info = &d; break; }
+        if (d.id == device_id) {
+            dev_info = &d;
+            break;
+        }
     }
-    if (!dev_info) return std::nullopt;
+    if (!dev_info) {
+        return std::unexpected(
+            BenchError{BenchErrorCode::UnknownDevice, "unknown device: " + device_id});
+    }
 
     ggml_backend_dev_t dev = resolve_device(device_id);
-    if (!dev) return std::nullopt;
+    if (!dev) {
+        return std::unexpected(BenchError{BenchErrorCode::UnknownDevice,
+                                          "device not in ggml backend registry: " + device_id});
+    }
 
     spdlog::info("benchmark start: {} ({})", dev_info->id, dev_info->name);
-    BenchResult r{
-        .device_id      = dev_info->id,
-        .device_name    = dev_info->name,
-        .memory_gbs     = bench_bandwidth(dev),
-        .compute_gflops = bench_q4k_matvec(dev),
-    };
-    spdlog::info("benchmark done: {} memory={:.1f} GB/s compute={:.1f} GFLOPS",
-                 r.device_id, r.memory_gbs, r.compute_gflops);
-    return r;
-}
+    const auto memory = bench_bandwidth(dev);
+    if (!memory) return std::unexpected(memory.error());
+    const auto compute = bench_q4k_matvec(dev);
+    if (!compute) return std::unexpected(compute.error());
+    const auto load = bench_load_bandwidth(dev);
+    if (!load) return std::unexpected(load.error());
 
-std::vector<BenchResult> bench_all(const Hardware& hardware) {
-    std::vector<BenchResult> out;
-    for (const auto& d : hardware.devices()) {
-        auto r = bench_one(hardware, d.id);
-        if (r) out.push_back(std::move(*r));
-    }
-    return out;
+    BenchResult r{
+        .device_id = dev_info->id,
+        .device_name = dev_info->name,
+        .memory_gbs = *memory,
+        .compute_gflops = *compute,
+        .load_gbs = *load,
+    };
+    spdlog::info("benchmark done: {} memory={:.1f} GB/s compute={:.1f} GFLOPS load={:.1f} GB/s",
+                 r.device_id, r.memory_gbs, r.compute_gflops, r.load_gbs);
+    return r;
 }
 
 }  // namespace mass_worker
