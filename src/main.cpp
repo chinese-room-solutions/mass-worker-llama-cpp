@@ -13,7 +13,9 @@
 // winsock2.h must be included before windows.h to avoid the legacy WinSock 1
 // being pulled in transitively. WIN32_LEAN_AND_MEAN keeps windows.h slim.
 #include <winsock2.h>
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <unistd.h>

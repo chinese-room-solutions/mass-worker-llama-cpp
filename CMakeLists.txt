@@ -286,6 +286,24 @@ configure_file(
     @ONLY
 )
 
+# --- Windows header hygiene for our own code ---
+# windows.h defines min/max as function-like macros, which breaks any TU that
+# also uses std::min/std::max — `std::min(a, b)` expands to `std::(a) < (b)…`,
+# an "illegal token on right side of ::". Several of our TUs pull in Windows
+# headers (directly or via <winsock2.h>) and were relying on ad hoc per-file
+# `#define NOMINMAX`, which only covered a handful of them.
+#
+# Set at directory scope rather than with a global add_compile_definitions()
+# because the vendored llama.cpp tree above defines WIN32_LEAN_AND_MEAN
+# *unguarded* in ~21 TUs — a project-wide definition would collide with every
+# one of them (C4005 macro redefinition). Placing it here, after
+# add_subdirectory(third_party/llama.cpp), scopes it to our sources only.
+# llama.cpp's own NOMINMAX defines are all #ifndef-guarded, so this stays
+# compatible if the vendored tree is ever moved below.
+if(WIN32)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # --- Core worker library + binary ---
 # CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS (the resolved CRT redist DLLs) is set above
 # and consumed inside src/CMakeLists.txt, which owns the mass-worker-llama-cpp target

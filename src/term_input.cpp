@@ -128,19 +128,19 @@ std::expected<RawMode, InputError> RawMode::enter() {
     const HANDLE in =
         CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                     nullptr, OPEN_EXISTING, 0, nullptr);
-    if (in == INVALID_HANDLE_VALUE) return std::unexpected(InputError::kNotATty);
+    if (in == INVALID_HANDLE_VALUE) return std::unexpected(InputError::KNotATty);
 
     DWORD mode = 0;
     if (!GetConsoleMode(in, &mode)) {
         CloseHandle(in);
-        return std::unexpected(InputError::kNotATty);
+        return std::unexpected(InputError::KNotATty);
     }
     // Clear line buffering, echo, and Ctrl-C processing so keys arrive raw and
     // Ctrl-C becomes a key record we translate, not a CTRL_C_EVENT.
     const DWORD raw = mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
     if (!SetConsoleMode(in, raw)) {
         CloseHandle(in);
-        return std::unexpected(InputError::kRawModeFailed);
+        return std::unexpected(InputError::KRawModeFailed);
     }
 
     RawMode rm;
@@ -179,15 +179,15 @@ RawMode::~RawMode() {
 // the caller is overkill. We return the first UTF-8 byte and rely on the console
 // being CP_UTF8; for ASCII this is exact, which covers the wizard's inputs.
 std::expected<Key, InputError> RawMode::read_key() {
-    if (in_handle_ == nullptr) return std::unexpected(InputError::kReadFailed);
+    if (in_handle_ == nullptr) return std::unexpected(InputError::KReadFailed);
     const HANDLE h = static_cast<HANDLE>(in_handle_);
     for (;;) {
         INPUT_RECORD rec{};
         DWORD got = 0;
         if (!ReadConsoleInputW(h, &rec, 1, &got)) {
-            return std::unexpected(InputError::kReadFailed);
+            return std::unexpected(InputError::KReadFailed);
         }
-        if (got == 0) return Key{KeyType::kEof, 0};
+        if (got == 0) return Key{KeyType::KEof, 0};
         if (rec.EventType != KEY_EVENT || !rec.Event.KeyEvent.bKeyDown) {
             continue;  // ignore key-up, focus, mouse, buffer-resize records
         }
@@ -195,41 +195,41 @@ std::expected<Key, InputError> RawMode::read_key() {
         const bool ctrl = (k.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
         switch (k.wVirtualKeyCode) {
             case VK_UP:
-                return Key{KeyType::kUp, 0};
+                return Key{KeyType::KUp, 0};
             case VK_DOWN:
-                return Key{KeyType::kDown, 0};
+                return Key{KeyType::KDown, 0};
             case VK_LEFT:
-                return Key{ctrl ? KeyType::kCtrlLeft : KeyType::kLeft, 0};
+                return Key{ctrl ? KeyType::KCtrlLeft : KeyType::KLeft, 0};
             case VK_RIGHT:
-                return Key{ctrl ? KeyType::kCtrlRight : KeyType::kRight, 0};
+                return Key{ctrl ? KeyType::KCtrlRight : KeyType::KRight, 0};
             case VK_HOME:
-                return Key{KeyType::kHome, 0};
+                return Key{KeyType::KHome, 0};
             case VK_END:
-                return Key{KeyType::kEnd, 0};
+                return Key{KeyType::KEnd, 0};
             case VK_RETURN:
-                return Key{KeyType::kEnter, 0};
+                return Key{KeyType::KEnter, 0};
             case VK_ESCAPE:
-                return Key{KeyType::kEsc, 0};
+                return Key{KeyType::KEsc, 0};
             case VK_TAB:
-                return Key{KeyType::kTab, 0};
+                return Key{KeyType::KTab, 0};
             case VK_BACK:
-                return Key{KeyType::kBackspace, 0};
+                return Key{KeyType::KBackspace, 0};
             default:
                 break;
         }
         const wchar_t ch = k.uChar.UnicodeChar;
         if (ch == 0) continue;  // a modifier-only / dead key — wait for the next
-        if (ch == 0x03) return Key{KeyType::kCtrlC, 0};
-        if (ch == L'\r' || ch == L'\n') return Key{KeyType::kEnter, 0};
+        if (ch == 0x03) return Key{KeyType::KCtrlC, 0};
+        if (ch == L'\r' || ch == L'\n') return Key{KeyType::KEnter, 0};
         // The console is set to CP_UTF8 (setup_main); for the ASCII/BMP inputs the
         // wizard takes, returning the low byte is exact. Non-ASCII paths/names are
         // an accepted edge (documented in the plan); they degrade, not corrupt.
-        if (ch < 0x80) return Key{KeyType::kChar, static_cast<char>(ch)};
-        return Key{KeyType::kChar, static_cast<char>(ch & 0xff)};
+        if (ch < 0x80) return Key{KeyType::KChar, static_cast<char>(ch)};
+        return Key{KeyType::KChar, static_cast<char>(ch & 0xff)};
     }
 }
 
-void RawMode::discard_pending() {
+void RawMode::discard_pending() const {
     if (in_handle_ != nullptr) FlushConsoleInputBuffer(static_cast<HANDLE>(in_handle_));
 }
 

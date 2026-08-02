@@ -9,7 +9,9 @@
 // winsock2 ahead of windows.h to avoid the legacy WinSock 1 being pulled in;
 // matches the ordering in main.cpp.
 #include <winsock2.h>
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <atomic>
@@ -106,7 +108,8 @@ DWORD WINAPI service_ctrl_handler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
 
 // Set by run_as_service before handing control to the SCM; the SCM invokes
 // service_main on its own thread, where these are the only way to reach the
-// already-constructed Runner.
+// already-constructed Runner. g_pending_cfg points at run_as_service's own
+// copy, which outlives the dispatcher call, so service_main may move from it.
 RunnerConfig*  g_pending_cfg     = nullptr;
 WorkerService* g_pending_service = nullptr;
 std::atomic<int> g_service_exit_code{0};
@@ -132,7 +135,7 @@ void WINAPI service_main(DWORD, LPWSTR*) {
 
 }  // namespace
 
-int run_as_service(RunnerConfig cfg, WorkerService& service) {
+int run_as_service(const RunnerConfig& cfg, WorkerService& service) {
     // The worker is a console-subsystem binary so a double-click / --setup run
     // gets a real terminal. Under the SCM there is no interactive terminal —
     // detach any inherited console so no window flashes and no stray console
@@ -141,7 +144,13 @@ int run_as_service(RunnerConfig cfg, WorkerService& service) {
     // none, so this is always safe on the service path.
     FreeConsole();
 
-    g_pending_cfg     = &cfg;
+    // Local copy the SCM thread owns: service_main moves it into the Runner,
+    // and StartServiceCtrlDispatcherW below blocks until that thread is done,
+    // so it stays alive for as long as service_main can reach it. The caller's
+    // cfg is const and must not be moved from.
+    RunnerConfig owned_cfg = cfg;
+
+    g_pending_cfg     = &owned_cfg;
     g_pending_service = &service;
 
     const std::wstring name = widen(kServiceName);

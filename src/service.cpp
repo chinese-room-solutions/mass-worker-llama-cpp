@@ -14,7 +14,9 @@
 #include "mass_worker/payload.hpp"
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <io.h>  // _waccess (writability probe)
 #include <windows.h>
 #else

@@ -4,10 +4,10 @@ name: release
 # target OS and attach the archived binary + raw installer to a single GitHub
 # Release. GPU backend per OS: Metal on Apple Silicon (native), Vulkan
 # elsewhere (cross-vendor). CUDA is a separate opt-in build and is not shipped
-# here. The active build legs run on self-hosted runners (no billed
-# minutes); only the publish job uses a hosted runner. CI covers the
-# Linux/Vulkan leg alone. The Windows leg is currently PARKED (commented out
-# in the matrix) until a self-hosted Windows runner exists.
+# here. All three build legs (Linux, Windows, macOS) run on self-hosted
+# runners (no billed minutes); only the publish job uses a hosted runner.
+# CI covers the Linux/Vulkan leg alone — Windows and Metal are compiled at
+# release time only.
 #
 # Mirrors ci.yml's vcpkg + mass-proto setup. Hosted-runner dep-install steps
 # are kept (gated on runner.environment) so a leg can be pointed back at a
@@ -63,6 +63,7 @@ jobs:
             triplet: x64-linux-release
             asset: mass-worker-llama-cpp_linux_amd64
             setup_asset: mass-worker-setup_linux_amd64
+            dir: mass-worker-llama-cpp
           # Self-hosted Windows/macOS runners are pre-provisioned (the dep
           # install steps below are hosted-only). Provision before registering:
           #   Windows (labels: self-hosted, Windows, X64): VS Build Tools
@@ -71,28 +72,35 @@ jobs:
           #     VULKAN_SDK set machine-wide (loader + glslc).
           #   macOS (labels: self-hosted, macOS, ARM64): Xcode command line
           #     tools, ninja, make, autoconf, automake, libtool.
-          # Windows leg is PARKED until a self-hosted Windows runner exists.
-          # Uncomment to activate; provision the box per the notes above first.
           # Windows uses the repo's static-md-rel overlay triplet — the same
           # config the local `make package` ships (static deps, dynamic CRT,
           # release-only); the stock x64-windows-static-release (static CRT)
           # has never been built here.
-          # - os: [self-hosted, Windows, X64]
-          #   label: windows-amd64
-          #   triplet: x64-windows-static-md-rel
-          #   asset: mass-worker-llama-cpp_windows_amd64
-          #   setup_asset: mass-worker-setup_windows_amd64
+          - os: [self-hosted, Windows, X64]
+            label: windows-amd64
+            triplet: x64-windows-static-md-rel
+            asset: mass-worker-llama-cpp_windows_amd64
+            setup_asset: mass-worker-setup_windows_amd64
+            # Deliberately a single letter. The vulkan-shaders-gen
+            # ExternalProject nests ~182 chars of its own path under the
+            # workspace (…/vulkan-shaders-gen-prefix/src/…-build/CMakeFiles/
+            # CMakeScratch/TryCompile-XXXXXX/CMakeFiles/cmTC_YYYYY.dir/), and
+            # MSVC's generated files must still land inside MAX_PATH (260).
+            # The runner's own _work/<repo>/<repo> layout already spends the
+            # repo name twice, so a third copy here overflows it.
+            dir: w
           - os: [self-hosted, macOS, ARM64]
             label: macos-arm64
             triplet: arm64-osx-release
             asset: mass-worker-llama-cpp_darwin_arm64
             setup_asset: mass-worker-setup_darwin_arm64
+            dir: mass-worker-llama-cpp
     steps:
       - name: Checkout mass-worker-llama-cpp
         uses: actions/checkout@v7
         with:
           submodules: recursive
-          path: mass-worker-llama-cpp
+          path: ${{ matrix.dir }}
 
       - name: Checkout mass-proto (sibling)
         uses: actions/checkout@v7
@@ -110,7 +118,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/vcpkg-cache
-          key: vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('mass-worker-llama-cpp/vcpkg.json') }}
+          key: vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles(format('{0}/vcpkg.json', matrix.dir)) }}
           restore-keys: |
             vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-
 
@@ -144,13 +152,19 @@ jobs:
           vulkan-use-cache: true
 
       # Caches compiled objects for the vendored llama.cpp/ggml tree + our own
-      # sources (the part vcpkg's binary cache doesn't cover). ccache on
-      # Linux/macOS, sccache on Windows; CMake picks it up as the launcher.
+      # sources (the part vcpkg's binary cache doesn't cover).
+      #
+      # Linux/macOS only. On Windows, sccache broke the abseil build with
+      # `fatal error C1083: Cannot open compiler generated file: ''` — MSVC's
+      # /Zi writes debug info to a separate PDB server, which sccache can't
+      # wrap. The deps still come from vcpkg's binary cache (restored above),
+      # so a warm Windows run rebuilds only our own tree.
       - name: Compiler cache
+        if: runner.os != 'Windows'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: release-${{ matrix.label }}
-          variant: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
+          variant: ccache
 
       - name: Bootstrap vcpkg
         shell: bash
@@ -169,7 +183,19 @@ jobs:
           # full commit graph — a shallow single-commit fetch can't serve it.
           # Trees/blobs are fetched lazily; the pinned checkout keeps the
           # toolchain deterministic and the cache key stable.
-          git clone --filter=tree:0 --no-checkout https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          #
+          # Windows takes a FULL clone instead. The runner service logs on to
+          # the non-interactive window station, whose desktop heap is the third
+          # SharedSection value (768KB by default). Git's threaded DNS resolver
+          # can't spawn there, so every lazy promisor fetch dies with
+          # `getaddrinfo() thread failed to start` — not a timeout, an instant
+          # thread-creation failure. A full clone carries every port tree up
+          # front, so `vcpkg install` needs no network of its own.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            git clone --no-checkout https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          else
+            git clone --filter=tree:0 --no-checkout https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          fi
           git -C "$RUNNER_TEMP/vcpkg" checkout "$VCPKG_COMMIT"
           if [ "$RUNNER_OS" = "Windows" ]; then
             "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
@@ -188,8 +214,16 @@ jobs:
         with:
           arch: x64
 
+      # msvc-dev-cmd exports the VS-bundled vcpkg as VCPKG_ROOT, clobbering the
+      # pinned clone the bootstrap step just made — Configure would then load
+      # the wrong toolchain (and an unpinned ports tree). Restore ours.
+      - name: Restore pinned VCPKG_ROOT (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
       - name: Configure
-        working-directory: mass-worker-llama-cpp
+        working-directory: ${{ matrix.dir }}
         shell: bash
         env:
           # vcpkg install runs inside configure and lazily git-fetches port
@@ -216,8 +250,13 @@ jobs:
             "${extra[@]}" \
             -DMASS_WORKER_LLAMA_CUDA=OFF
 
+      # bash, not the Windows default: a shell-less `run` is written to a .ps1,
+      # and the runner service account has no CurrentUser execution policy, so
+      # it inherits the LocalMachine default (Restricted) and refuses to load
+      # the script. Every other run step here is bash already.
       - name: Build
-        working-directory: mass-worker-llama-cpp
+        working-directory: ${{ matrix.dir }}
+        shell: bash
         run: cmake --build build --config Release -j
 
       # Installer wizard (mass-worker-setup + worker + libs as payload),
@@ -231,11 +270,12 @@ jobs:
       # self-extracting installer after it bundles it into the container, so the
       # Archive step below can rename + upload it for the join bootstrap.
       - name: Package installer
-        working-directory: mass-worker-llama-cpp
+        working-directory: ${{ matrix.dir }}
+        shell: bash
         run: make package KEEP_RAW_INSTALLER=1
 
       - name: Archive
-        working-directory: mass-worker-llama-cpp
+        working-directory: ${{ matrix.dir }}
         shell: bash
         run: |
           name="${{ matrix.asset }}"
@@ -271,16 +311,16 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/vcpkg-cache
-          key: vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('mass-worker-llama-cpp/vcpkg.json') }}
+          key: vcpkg-${{ matrix.label }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles(format('{0}/vcpkg.json', matrix.dir)) }}
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: |
-            mass-worker-llama-cpp/*.tar.gz
-            mass-worker-llama-cpp/*.zip
-            mass-worker-llama-cpp/mass-worker-llama-cpp-setup_*
-            mass-worker-llama-cpp/${{ matrix.setup_asset }}*
+            ${{ matrix.dir }}/*.tar.gz
+            ${{ matrix.dir }}/*.zip
+            ${{ matrix.dir }}/mass-worker-llama-cpp-setup_*
+            ${{ matrix.dir }}/${{ matrix.setup_asset }}*
 
   publish:
     needs: build
