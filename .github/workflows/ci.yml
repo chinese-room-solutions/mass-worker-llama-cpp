@@ -2,8 +2,8 @@ name: CI
 
 # CI runs on the self-hosted Linux runner (16-core, 32GB, real Vulkan device)
 # — no billed minutes, persistent local caches, so even cold builds are cheap.
-# macOS/Metal is compiled by release.yml on its own self-hosted runner;
-# the Windows leg there is parked until a self-hosted Windows runner exists.
+# macOS/Metal and Windows/Vulkan are compiled by release.yml on their own
+# self-hosted runners.
 # Optional extra Debug leg (catches UB/asserts):
 #   build_type: [Release, Debug]
 

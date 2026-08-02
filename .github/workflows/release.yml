@@ -4,10 +4,10 @@ name: release
 # target OS and attach the archived binary + raw installer to a single GitHub
 # Release. GPU backend per OS: Metal on Apple Silicon (native), Vulkan
 # elsewhere (cross-vendor). CUDA is a separate opt-in build and is not shipped
-# here. The active build legs run on self-hosted runners (no billed
-# minutes); only the publish job uses a hosted runner. CI covers the
-# Linux/Vulkan leg alone. The Windows leg is currently PARKED (commented out
-# in the matrix) until a self-hosted Windows runner exists.
+# here. All three build legs (Linux, Windows, macOS) run on self-hosted
+# runners (no billed minutes); only the publish job uses a hosted runner.
+# CI covers the Linux/Vulkan leg alone — Windows and Metal are compiled at
+# release time only.
 #
 # Mirrors ci.yml's vcpkg + mass-proto setup. Hosted-runner dep-install steps
 # are kept (gated on runner.environment) so a leg can be pointed back at a
@@ -71,17 +71,15 @@ jobs:
           #     VULKAN_SDK set machine-wide (loader + glslc).
           #   macOS (labels: self-hosted, macOS, ARM64): Xcode command line
           #     tools, ninja, make, autoconf, automake, libtool.
-          # Windows leg is PARKED until a self-hosted Windows runner exists.
-          # Uncomment to activate; provision the box per the notes above first.
           # Windows uses the repo's static-md-rel overlay triplet — the same
           # config the local `make package` ships (static deps, dynamic CRT,
           # release-only); the stock x64-windows-static-release (static CRT)
           # has never been built here.
-          # - os: [self-hosted, Windows, X64]
-          #   label: windows-amd64
-          #   triplet: x64-windows-static-md-rel
-          #   asset: mass-worker-llama-cpp_windows_amd64
-          #   setup_asset: mass-worker-setup_windows_amd64
+          - os: [self-hosted, Windows, X64]
+            label: windows-amd64
+            triplet: x64-windows-static-md-rel
+            asset: mass-worker-llama-cpp_windows_amd64
+            setup_asset: mass-worker-setup_windows_amd64
           - os: [self-hosted, macOS, ARM64]
             label: macos-arm64
             triplet: arm64-osx-release
