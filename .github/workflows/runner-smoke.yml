@@ -38,11 +38,11 @@ jobs:
           glslc --version
           ls "$VULKAN_SDK/Lib/vulkan-1.lib"
 
-      - name: Scratch space is on D:
+      - name: Scratch space is on D drive
         shell: bash
         run: |
           set -e
-          echo "workspace : $GITHUB_WORKSPACE"
-          echo "runner temp: $RUNNER_TEMP"
+          echo "workspace=$GITHUB_WORKSPACE"
+          echo "runner_temp=$RUNNER_TEMP"
           case "$GITHUB_WORKSPACE" in [Dd]:*|/d/*) ;; *) echo "workspace not on D:"; exit 1 ;; esac
           case "$RUNNER_TEMP"      in [Dd]:*|/d/*) ;; *) echo "temp not on D:"; exit 1 ;; esac
