@@ -1,0 +1,48 @@
+name: runner-smoke
+
+# Manual sanity check for the self-hosted Windows runner's provisioning:
+# confirms the toolchain the release job depends on is reachable from the
+# service account, and that scratch space lands on D: (C: is small here).
+# Not part of CI — dispatch it after re-provisioning the runner box.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - name: MSVC build environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Toolchain reachable from the runner service
+        shell: bash
+        run: |
+          set -e
+          for t in ninja make 7z git cmake cl; do
+            command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }
+            echo "ok $t -> $(command -v "$t")"
+          done
+          # cl must resolve to MSVC, not the msys64 gcc that shares a PATH dir.
+          command -v cl | grep -qi 'Microsoft Visual Studio' || {
+            echo "cl is not MSVC: $(command -v cl)"; exit 1; }
+
+      - name: Vulkan SDK present
+        shell: bash
+        run: |
+          set -e
+          [ -n "$VULKAN_SDK" ] || { echo "VULKAN_SDK unset"; exit 1; }
+          echo "VULKAN_SDK=$VULKAN_SDK"
+          glslc --version
+          ls "$VULKAN_SDK/Lib/vulkan-1.lib"
+
+      - name: Scratch space is on D:
+        shell: bash
+        run: |
+          set -e
+          echo "workspace : $GITHUB_WORKSPACE"
+          echo "runner temp: $RUNNER_TEMP"
+          case "$GITHUB_WORKSPACE" in [Dd]:*|/d/*) ;; *) echo "workspace not on D:"; exit 1 ;; esac
+          case "$RUNNER_TEMP"      in [Dd]:*|/d/*) ;; *) echo "temp not on D:"; exit 1 ;; esac
