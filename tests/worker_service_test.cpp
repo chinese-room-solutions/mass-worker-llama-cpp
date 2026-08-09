@@ -61,6 +61,37 @@ INSTANTIATE_TEST_SUITE_P(
                       {}}),
     [](const ::testing::TestParamInfo<PlacementCase>& tpi) { return tpi.param.name; });
 
+struct MaxConcurrentCase {
+    std::string name;
+    int32_t hub;
+    int32_t hints;
+    int32_t expect;
+};
+
+class ResolveMaxConcurrentTest : public ::testing::TestWithParam<MaxConcurrentCase> {};
+
+TEST_P(ResolveMaxConcurrentTest, DecisionTable) {
+    const auto& c = GetParam();
+    EXPECT_EQ(mass_worker::resolve_max_concurrent(c.hub, c.hints), c.expect);
+}
+
+INSTANTIATE_TEST_SUITE_P(Contract, ResolveMaxConcurrentTest,
+                         ::testing::Values(
+                             // The hub sized the pool from the model's benchmark row and owns
+                             // the memory gate that cleared it, so its number wins over a
+                             // conflicting hints value — in both directions, never a min/max.
+                             MaxConcurrentCase{"hub_overrides_smaller_hints", 8, 2, 8},
+                             MaxConcurrentCase{"hub_overrides_larger_hints", 2, 8, 2},
+                             MaxConcurrentCase{"hub_overrides_hints_auto", 4, 0, 4},
+                             // Hub said nothing: the gateway's hints value applies unchanged.
+                             MaxConcurrentCase{"hub_silent_falls_back_to_hints", 0, 3, 3},
+                             // Neither named a number — worker-side growth to the VRAM
+                             // headroom watermark.
+                             MaxConcurrentCase{"both_silent_is_auto", 0, 0, 0}),
+                         [](const ::testing::TestParamInfo<MaxConcurrentCase>& p) {
+                             return p.param.name;
+                         });
+
 struct DeviceLossCase {
     std::string name;
     std::string msg;

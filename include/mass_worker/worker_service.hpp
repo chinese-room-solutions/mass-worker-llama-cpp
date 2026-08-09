@@ -59,6 +59,18 @@ namespace mass_worker {
 [[nodiscard]] std::vector<std::string> loaded_model_file_keys(
     const mass::v1::worker::HubLoadModel& req);
 
+// resolve_max_concurrent picks the context-pool size for one load. Two
+// sources now name the same quantity: HubLoadModel.max_concurrent, which
+// the hub derives from the model's measured benchmark row, and the
+// gateway-private LoadHints.max_concurrent the hub cannot decode.
+//
+// The hub's value wins whenever it states one (> 0), unconditionally —
+// it is the side that also owns the memory gate a pinned pool is cleared
+// against, so a hints value disagreeing with it would size the pool
+// against numbers nothing checked. 0 means the hub said nothing and the
+// hints value applies, and 0 from both is worker-side auto growth.
+[[nodiscard]] int32_t resolve_max_concurrent(int32_t hub_value, int32_t hints_value);
+
 // mentions_device_loss matches the spellings a lost GPU device produces
 // across layers — vulkan.hpp exceptions ("ErrorDeviceLost"), the C API
 // ("VK_ERROR_DEVICE_LOST"), and prose ("device lost") — case-insensitive,

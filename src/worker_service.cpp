@@ -230,6 +230,10 @@ std::vector<std::string> enabled_placement_ids(
     return ids;
 }
 
+int32_t resolve_max_concurrent(int32_t hub_value, int32_t hints_value) {
+    return hub_value > 0 ? hub_value : hints_value;
+}
+
 std::vector<std::string> loaded_model_file_keys(const pb::HubLoadModel& req) {
     std::vector<std::string> keys;
     keys.reserve(static_cast<std::size_t>(req.files_size()));
@@ -920,6 +924,11 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
                     }
                 }
                 auto cfg = to_chat_load_cfg(hints, by_role, default_vram_headroom_pct_);
+                // The hub sizes the pool from the model's measured benchmark;
+                // its number overrides whatever the gateway put in the
+                // hints blob (see resolve_max_concurrent).
+                cfg.max_concurrent =
+                    resolve_max_concurrent(req.max_concurrent(), cfg.max_concurrent);
                 cfg.allowed_devices = std::move(whitelist.devices);
                 cfg.device_ids = std::move(whitelist.ids);
                 spdlog::info("loading chat model id={} path={}", mid, cfg.path.string());
@@ -955,6 +964,8 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
                 }
             }
             auto cfg = to_embed_load_cfg(hints, by_role, default_vram_headroom_pct_);
+            // See the chat branch: the hub's pool size wins.
+            cfg.max_concurrent = resolve_max_concurrent(req.max_concurrent(), cfg.max_concurrent);
             cfg.allowed_devices = std::move(whitelist.devices);
             cfg.device_ids = std::move(whitelist.ids);
             spdlog::info("loading embedding model id={} path={}", mid, cfg.path.string());
