@@ -61,6 +61,8 @@ const char* hub_msg_kind(const mass::v1::worker::HubMessage& m) {
             return "delete_cache_files";
         case HM::kBenchmark:
             return "benchmark";
+        case HM::kModelBenchmark:
+            return "model_benchmark";
         case HM::kSetEnabledDevices:
             return "set_enabled_devices";
         case HM::kEnrolled:
@@ -400,10 +402,11 @@ Runner::SessionResult Runner::run_one_session() {
     // comfortably exceed the sum of realistic per-model pool sizes; it
     // is not derived from core counts.
     //
-    // kLoadModel and kBenchmark go to their own single control thread
-    // (below): a load is a potentially multi-GB, hours-long fetch, and
-    // running it inline would head-of-line-block the receive loop — a
-    // CancelJob frame could not even be READ mid-download. Unload,
+    // kLoadModel, kBenchmark and kModelBenchmark go to their own single
+    // control thread (below): a load is a potentially multi-GB,
+    // hours-long fetch, and running it inline would head-of-line-block
+    // the receive loop — a CancelJob frame could not even be READ
+    // mid-download. A model benchmark is a load plus a job. Unload,
     // CancelJob, DeleteCacheFiles, and SetEnabledDevices remain inline:
     // all are fast, and CancelJob especially must never queue behind
     // the very work it is trying to cancel.
@@ -524,7 +527,8 @@ Runner::SessionResult Runner::run_one_session() {
         }
 
         if (incoming.msg_case() == mass::v1::worker::HubMessage::kLoadModel ||
-            incoming.msg_case() == mass::v1::worker::HubMessage::kBenchmark) {
+            incoming.msg_case() == mass::v1::worker::HubMessage::kBenchmark ||
+            incoming.msg_case() == mass::v1::worker::HubMessage::kModelBenchmark) {
             // Mark the load pending BEFORE enqueueing, on this thread, so an
             // AssignJob read right after its LoadModel can never observe the
             // gap between dequeue and execution.

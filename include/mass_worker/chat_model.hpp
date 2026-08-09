@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "ggml-backend.h"
+#include "mass_worker/ctx_pool.hpp"
 #include "mass_worker/llama_handles.hpp"
 
 namespace mass_worker {
@@ -242,6 +243,12 @@ public:
     // populated at load time by WorkerService.
     [[nodiscard]] const std::vector<std::string>& device_ids() const { return cfg_.device_ids; }
 
+    // bench_probe measures this model for a MASS model benchmark (see
+    // probe_model_bench). Valid only on a pool-of-1 load with nothing in
+    // flight — the benchmark's exclusivity contract is what guarantees
+    // that, and the whole-device memory readings are wrong without it.
+    [[nodiscard]] ModelBenchProbe bench_probe(const std::vector<DevMemSnap>& before_load);
+
 private:
     explicit ChatModel(ChatModelLoadConfig cfg);
     [[nodiscard]] std::expected<void, ModelError> initialize();
@@ -256,6 +263,9 @@ private:
 
     ChatModelLoadConfig cfg_;
     LlamaModelPtr model_;
+    // The exact parameters every pool context was built with, kept so a
+    // benchmark can price one more slot identically.
+    llama_context_params cparams_{};
     std::vector<LlamaContextPtr> ctx_pool_;  // owns the pool's contexts
 
     // Free-list of borrowable contexts plus its synchronisation. The list

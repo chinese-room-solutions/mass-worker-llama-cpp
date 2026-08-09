@@ -93,6 +93,45 @@ INSTANTIATE_TEST_SUITE_P(
         DeviceLossCase{"empty", "", false}),
     [](const ::testing::TestParamInfo<DeviceLossCase>& p) { return p.param.name; });
 
+struct AllocFailureCase {
+    std::string name;
+    std::string msg;
+    bool expect;
+};
+
+class MentionsAllocationFailureTest : public ::testing::TestWithParam<AllocFailureCase> {};
+
+TEST_P(MentionsAllocationFailureTest, DecisionTable) {
+    const auto& c = GetParam();
+    EXPECT_EQ(mass_worker::mentions_allocation_failure(c.msg), c.expect);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Contract, MentionsAllocationFailureTest,
+    ::testing::Values(
+        // The spellings that legitimately make a model benchmark
+        // INCAPABLE — a verdict MASS never retries.
+        AllocFailureCase{"vulkan_hpp_exception",
+                         "unhandled exception: vk::Device::createBuffer: ErrorOutOfDeviceMemory",
+                         true},
+        AllocFailureCase{"ggml_prose", "ggml_backend_alloc_ctx_tensors: failed to allocate buffer",
+                         true},
+        AllocFailureCase{"cuda_prose", "cudaMalloc failed: out of memory", true},
+        AllocFailureCase{"std_bad_alloc", "unhandled exception: std::bad_alloc", true},
+        AllocFailureCase{"pool_slot_zero",
+                         "llama_init_from_model failed at slot 0 — not enough VRAM for even one "
+                         "context",
+                         true},
+        // Everything else stays TRANSIENT. "headroom" contains "room",
+        // which is why a bare "oom" is not one of the needles.
+        AllocFailureCase{"headroom_is_not_oom", "VRAM headroom threshold reached on device 0",
+                         false},
+        AllocFailureCase{"corrupt_weights", "llama_model_load_from_file failed for /m/x.gguf",
+                         false},
+        AllocFailureCase{"device_loss", "vkQueueSubmit failed: VK_ERROR_DEVICE_LOST", false},
+        AllocFailureCase{"empty", "", false}),
+    [](const ::testing::TestParamInfo<AllocFailureCase>& p) { return p.param.name; });
+
 // The register frame must carry the worker's EFFECTIVE headroom watermark:
 // MASS's pool-size and wall-clock projections use it instead of assuming a
 // compiled-in default, so a reconfigured worker must report its own value.

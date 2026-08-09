@@ -100,6 +100,7 @@ std::expected<void, ModelError> EmbeddingModel::initialize() {
     cparams.embeddings = true;
     cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
 
+    cparams_ = cparams;
     auto pool =
         grow_ctx_pool(model_.get(), cparams,
                       {.max_concurrent = cfg_.max_concurrent,
@@ -122,6 +123,11 @@ std::expected<void, ModelError> EmbeddingModel::initialize() {
     spdlog::info("embedding model loaded: {} (n_embd={}, n_ctx={}, slots={})", cfg_.path.string(),
                  n_embd_, llama_n_ctx(ctx_pool_.front().get()), pool_size);
     return {};
+}
+
+ModelBenchProbe EmbeddingModel::bench_probe(const std::vector<DevMemSnap>& before_load) {
+    return probe_model_bench(model_.get(), ctx_pool_.front().get(), cparams_, cfg_.allowed_devices,
+                             before_load);
 }
 
 llama_context* EmbeddingModel::acquire_ctx(const IsCancelledFn& is_cancelled) {

@@ -218,6 +218,7 @@ std::expected<void, ModelError> ChatModel::initialize() {
     // per-input compute graphs whose size depends on image/audio
     // dimensions, so a pool that fills the device makes
     // mtmd_helper_eval_chunks OOM mid-request.
+    cparams_ = cparams;
     auto pool =
         grow_ctx_pool(model_.get(), cparams,
                       {.max_concurrent = cfg_.max_concurrent,
@@ -243,6 +244,11 @@ std::expected<void, ModelError> ChatModel::initialize() {
         llama_n_ctx(ctx_pool_.front().get()), pool_size,
         cfg_.max_concurrent > 0 ? std::to_string(cfg_.max_concurrent) : std::string("auto"));
     return {};
+}
+
+ModelBenchProbe ChatModel::bench_probe(const std::vector<DevMemSnap>& before_load) {
+    return probe_model_bench(model_.get(), ctx_pool_.front().get(), cparams_, cfg_.allowed_devices,
+                             before_load);
 }
 
 llama_context* ChatModel::acquire_ctx(const IsCancelledFn& is_cancelled) {

@@ -24,6 +24,7 @@
 namespace mass::v1::worker {
 class HubLoadModel;
 class HubMessage;
+class HubModelBenchmark;
 class WorkerMessage;
 class WorkerRegister;
 class WorkerHeartbeat;
@@ -64,6 +65,18 @@ namespace mass_worker {
 // so the WorkerService::device_lost flag catches the error whichever
 // layer's text reaches the frame.
 [[nodiscard]] bool mentions_device_loss(std::string_view msg);
+
+// mentions_allocation_failure matches the spellings an out-of-memory or
+// refused allocation produces across layers — vulkan.hpp exceptions
+// ("ErrorOutOfDeviceMemory"), ggml's own log prose ("failed to allocate"),
+// the C++ runtime ("std::bad_alloc") — case-insensitive.
+//
+// It is the ONLY thing that may turn a model-benchmark failure into the
+// INCAPABLE verdict, which MASS treats as permanent and never retries.
+// So it matches allocation vocabulary and nothing else: a bare "oom" is
+// deliberately absent (it is a substring of "headroom"), and any error
+// it doesn't recognise stays TRANSIENT.
+[[nodiscard]] bool mentions_allocation_failure(std::string_view msg);
 
 // kRuntimeName is the wire identifier MASS uses to route this worker to its
 // matching gateway (mass-runtime-gateway-llama-cpp). Must match the gateway's
@@ -162,6 +175,28 @@ public:
 private:
     [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage> execute_impl(
         const mass::v1::worker::HubMessage& job, EmittedFn emit);
+
+    // run_job executes one gateway payload against an already-resolved
+    // model and returns the terminal WorkerJobResult frame. Exactly one
+    // of chat/embed is set. Shared by the AssignJob path and the model
+    // benchmark, so a benched request runs through the same code as a
+    // dispatched one — that identity is what makes the measured time
+    // mean anything.
+    [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage> run_job(
+        const std::shared_ptr<ChatModel>& chat, const std::shared_ptr<EmbeddingModel>& embed,
+        const std::string& model_id, const std::string& job_id, const std::string& payload,
+        const EmittedFn& emit);
+
+    // run_model_benchmark answers a HubModelBenchmark: fetch, load with a
+    // pool of one, run the payload against the wall clock, probe the
+    // model (see ModelBenchProbe), unload, reply. The fetched files stay
+    // on disk — benching is how a model reaches a worker's cache.
+    //
+    // The bench never registers the model in the loaded maps: it is not
+    // dispatchable work, and a heartbeat advertising capacity for it
+    // would invite the very dispatch the bench's exclusivity forbids.
+    [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage> run_model_benchmark(
+        const mass::v1::worker::HubModelBenchmark& req);
 
     std::atomic<bool> device_lost_{false};
 

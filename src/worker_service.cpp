@@ -349,13 +349,33 @@ std::vector<std::string> WorkerService::cache_files() const {
     return cache_.list_gguf();
 }
 
-bool mentions_device_loss(std::string_view msg) {
+namespace {
+
+std::string lowercased(std::string_view msg) {
     std::string lower(msg);
     std::ranges::transform(lower, lower.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lower;
+}
+
+}  // namespace
+
+bool mentions_device_loss(std::string_view msg) {
+    const std::string lower = lowercased(msg);
     return lower.find("devicelost") != std::string::npos ||
            lower.find("device_lost") != std::string::npos ||
            lower.find("device lost") != std::string::npos;
+}
+
+bool mentions_allocation_failure(std::string_view msg) {
+    const std::string lower = lowercased(msg);
+    static constexpr std::string_view kNeedles[] = {
+        "out of memory",     "outofdevicememory",  "outofhostmemory",     "bad_alloc",
+        "bad alloc",         "failed to allocate", "cannot allocate",     "unable to allocate",
+        "allocation failed", "not enough vram",    "insufficient memory",
+    };
+    return std::ranges::any_of(
+        kNeedles, [&](std::string_view n) { return lower.find(n) != std::string::npos; });
 }
 
 namespace {
@@ -373,6 +393,9 @@ std::string_view frame_error_text(const pb::WorkerMessage& msg) {
             return msg.unload_model().error();
         case pb::WorkerMessage::kBenchmark:
             return msg.benchmark().error();
+        case pb::WorkerMessage::kModelBenchmark:
+            return msg.model_benchmark().has_failure() ? msg.model_benchmark().failure().message()
+                                                       : std::string_view{};
         default:
             return {};
     }
@@ -406,6 +429,39 @@ std::unique_ptr<pb::WorkerMessage> unload_error(std::string_view job_id, std::st
     um->set_model_id(std::string(model_id));
     um->set_error(std::string(msg));
     return out;
+}
+
+std::unique_ptr<pb::WorkerMessage> bench_failure(std::string_view model_id,
+                                                 pb::ModelBenchmarkFailureKind kind,
+                                                 std::string_view msg) {
+    spdlog::error("model benchmark failed model_id={} kind={} {}", model_id,
+                  pb::ModelBenchmarkFailureKind_Name(kind), msg);
+    auto out = std::make_unique<pb::WorkerMessage>();
+    auto* mb = out->mutable_model_benchmark();
+    mb->set_model_id(std::string(model_id));
+    auto* f = mb->mutable_failure();
+    f->set_kind(kind);
+    f->set_message(std::string(msg));
+    return out;
+}
+
+// classify_bench_failure decides whether MASS may treat a failed bench as
+// a permanent capability verdict. INCAPABLE is reserved for the two
+// signals that genuinely say "this device set cannot hold this model":
+// the context allocator refusing slot 0 (ContextCreateFailed exists for
+// nothing else), and an allocation spelling anywhere in the message.
+// Everything else — a corrupt file, a template failure, an
+// unclassifiable throw — is TRANSIENT, because MASS retries those and
+// only persists them as incapable after the retry cap.
+pb::ModelBenchmarkFailureKind classify_bench_failure(std::string_view msg,
+                                                     bool context_alloc_failed) {
+    return context_alloc_failed || mentions_allocation_failure(msg)
+               ? pb::MODEL_BENCHMARK_FAILURE_KIND_INCAPABLE
+               : pb::MODEL_BENCHMARK_FAILURE_KIND_TRANSIENT;
+}
+
+pb::ModelBenchmarkFailureKind classify_load_failure(const ModelError& e) {
+    return classify_bench_failure(e.message, e.code == ModelErrorCode::ContextCreateFailed);
 }
 
 // model_file_role_to_string maps the proto enum to the short string tags
@@ -510,6 +566,11 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute(const pb::HubMessage& 
                 br->set_error(msg);
                 break;
             }
+            case HM::kModelBenchmark:
+                out =
+                    bench_failure(job.model_benchmark().model_id(),
+                                  classify_bench_failure(msg, /*context_alloc_failed=*/false), msg);
+                break;
             default:
                 break;  // fire-and-forget kinds have no error frame.
         }
@@ -524,6 +585,251 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute(const pb::HubMessage& 
             "device loss detected; runner will restart the process after this frame ships");
     }
     return out;
+}
+
+std::unique_ptr<pb::WorkerMessage> WorkerService::run_job(
+    const std::shared_ptr<ChatModel>& chat, const std::shared_ptr<EmbeddingModel>& embed,
+    const std::string& model_id, const std::string& job_id, const std::string& payload,
+    const EmittedFn& emit) {
+    lcpp::Job decoded;
+    if (!decoded.ParseFromString(payload)) {
+        return terminal_error(job_id, "AssignJob: invalid payload encoding");
+    }
+
+    // Active accounting: a single-item job holds one job-scoped
+    // guard. Batch jobs occupy up to pool_size() context slots at
+    // once, so each in-flight item holds its own guard instead — a
+    // job-scoped guard would report active=1 while N slots run, and
+    // the heartbeat's pool − active would over-advertise capacity
+    // by N−1, inviting over-dispatch from MASS. With per-item
+    // guards, `active` equals slots actually in use (and the
+    // heartbeat's active_jobs counts in-flight items, not jobs).
+    const bool per_item_active =
+        decoded.kind() == lcpp::JOB_KIND_BATCH_CHAT || decoded.kind() == lcpp::JOB_KIND_BATCH_EMBED;
+    std::optional<ActiveGuard> job_guard;
+    if (!per_item_active) {
+        job_guard.emplace(active_mu_, active_per_model_, active_total_, model_id);
+    }
+
+    switch (decoded.kind()) {
+        case lcpp::JOB_KIND_CHAT: {
+            if (!chat) return terminal_error(job_id, "Chat: not a chat model");
+            auto parts = to_chat_request(decoded.chat());
+            if (!parts) return terminal_error(job_id, "Chat: " + parts.error());
+
+            const bool streaming = decoded.chat().stream();
+
+            // For streaming, emit per-token JobChunks as they're
+            // generated. The terminal frame still ships the final
+            // chat_final with usage + finish_reason; its `message`
+            // is left empty since the body already streamed.
+            //
+            // A failed Write means MASS is gone (restart, dropped
+            // stream): nothing downstream can receive the result, so
+            // generating further tokens only burns the GPU until
+            // max_tokens. The flag folds into is_cancelled below —
+            // both lambdas run on this job's generation thread, so a
+            // plain bool suffices.
+            bool emit_failed = false;
+            ChatModel::OnTokenFn on_token;
+            if (streaming) {
+                on_token = [&](std::string_view piece) {
+                    if (emit_failed) return;
+                    lcpp::JobChunk delta;
+                    auto* cc = delta.mutable_chat();
+                    cc->set_role(lcpp::ROLE_ASSISTANT);
+                    cc->set_content(std::string(piece));
+                    pb::WorkerMessage msg;
+                    auto* jr = msg.mutable_job_result();
+                    jr->set_job_id(job_id);
+                    delta.SerializeToString(jr->mutable_chunk());
+                    if (!emit(msg)) {
+                        emit_failed = true;
+                        spdlog::warn("streaming write failed job_id={} — cancelling generation",
+                                     job_id);
+                    }
+                };
+            }
+
+            // Cancellation: chat_completion_stream polls this
+            // function between sampler steps. The set is shared
+            // across all execute() calls, keyed by job_id, so
+            // multiple in-flight jobs each see only their own
+            // cancel signal. A worker-wide stop cancels everything,
+            // and a failed streaming write cancels this job.
+            auto is_cancelled = [this, &job_id, &emit_failed]() {
+                return stopping_.load(std::memory_order_acquire) || emit_failed ||
+                       is_job_cancel_requested(job_id);
+            };
+            auto result = chat->chat_completion_stream(parts->messages, parts->sampling, on_token,
+                                                       is_cancelled);
+            // Always clear the cancel marker after the call —
+            // even on success, in case HubCancelJob arrived after
+            // the job completed naturally. Stale entries would
+            // never auto-clear otherwise.
+            clear_job_cancel(job_id);
+            if (!result) {
+                // Cancellation flows the same way as any other
+                // error: a terminal frame carrying the message
+                // text. MASS tells the operator-induced case
+                // apart by its own cancel-intent marker, not by
+                // the wire string, so we keep the existing
+                // "Chat: " prefix for consistency with real
+                // failures.
+                return terminal_error(job_id, "Chat: " + result.error().message);
+            }
+
+            // Build the terminal JobChunk → encode into
+            // WorkerJobResult.completed.
+            lcpp::JobChunk chunk;
+            fill_chat_final(chunk.mutable_chat_final(), *result,
+                            /*include_message=*/!streaming);
+
+            auto out = std::make_unique<pb::WorkerMessage>();
+            auto* jr = out->mutable_job_result();
+            jr->set_job_id(job_id);
+            chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
+            return out;
+        }
+        case lcpp::JOB_KIND_EMBED: {
+            if (!embed) return terminal_error(job_id, "Embed: not an embedding model");
+            auto is_cancelled = [this, &job_id]() {
+                return stopping_.load(std::memory_order_acquire) || is_job_cancel_requested(job_id);
+            };
+            auto vec = embed->embed(decoded.embed().input(), is_cancelled);
+            clear_job_cancel(job_id);
+            if (!vec) return terminal_error(job_id, "Embed: " + vec.error().message);
+
+            lcpp::JobChunk chunk;
+            auto* er = chunk.mutable_embed();
+            er->set_id("cpp-emb-" +
+                       std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count()));
+            for (float v : *vec) er->add_embedding(v);
+
+            auto out = std::make_unique<pb::WorkerMessage>();
+            auto* jr = out->mutable_job_result();
+            jr->set_job_id(job_id);
+            chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
+            return out;
+        }
+        case lcpp::JOB_KIND_BATCH_EMBED: {
+            if (!embed) return terminal_error(job_id, "BatchEmbed: not an embedding model");
+            const auto& inputs = decoded.batch_embed().inputs();
+
+            // Inputs fan out across the model's context pool; more
+            // threads than slots would only pile up in acquire_ctx.
+            const auto max_conc = std::min<std::size_t>(
+                static_cast<std::size_t>(inputs.size()),
+                static_cast<std::size_t>(std::max<int32_t>(1, embed->pool_size())));
+            auto run_item =
+                [&](std::size_t i,
+                    std::stop_token batch_abort) -> std::expected<std::vector<float>, std::string> {
+                ActiveGuard item_guard(active_mu_, active_per_model_, active_total_, model_id);
+                auto is_cancelled = [&]() {
+                    return stopping_.load(std::memory_order_acquire) ||
+                           batch_abort.stop_requested() || is_job_cancel_requested(job_id);
+                };
+                auto vec = embed->embed(inputs[static_cast<int>(i)], is_cancelled);
+                if (!vec) return std::unexpected(vec.error().message);
+                return std::move(*vec);
+            };
+            auto vecs =
+                run_batch_items(static_cast<std::size_t>(inputs.size()), max_conc, run_item);
+            clear_job_cancel(job_id);
+            if (!vecs) {
+                return terminal_error(job_id, "BatchEmbed item " +
+                                                  std::to_string(vecs.error().index) + ": " +
+                                                  vecs.error().error);
+            }
+
+            lcpp::JobChunk chunk;
+            auto* br = chunk.mutable_batch_embed();
+            br->set_id(monotonic_id("cpp-bemb-"));
+            for (std::size_t i = 0; i < vecs->size(); ++i) {
+                auto* item = br->add_items();
+                item->set_index(static_cast<int32_t>(i));
+                for (float v : (*vecs)[i]) item->add_embedding(v);
+            }
+
+            auto out = std::make_unique<pb::WorkerMessage>();
+            auto* jr = out->mutable_job_result();
+            jr->set_job_id(job_id);
+            chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
+            return out;
+        }
+        case lcpp::JOB_KIND_BATCH_CHAT: {
+            if (!chat) return terminal_error(job_id, "BatchChat: not a chat model");
+            const auto& items = decoded.batch_chat().items();
+            if (items.empty()) return terminal_error(job_id, "BatchChat: items must be non-empty");
+
+            // Items fan out across the model's context pool (see
+            // max_conc rationale on the batch-embed case). The whole
+            // batch is still one job: a single cancel aborts every
+            // item, and the first item failure stops the remainder
+            // via the batch stop_token. No per-token streaming for
+            // batch chat.
+            const auto max_conc = std::min<std::size_t>(
+                static_cast<std::size_t>(items.size()),
+                static_cast<std::size_t>(std::max<int32_t>(1, chat->pool_size())));
+            auto run_item =
+                [&](std::size_t i,
+                    std::stop_token batch_abort) -> std::expected<lcpp::ChatFinal, std::string> {
+                auto parts = to_chat_request(items[static_cast<int>(i)]);
+                if (!parts) return std::unexpected(parts.error());
+                ActiveGuard item_guard(active_mu_, active_per_model_, active_total_, model_id);
+                auto is_cancelled = [&]() {
+                    return stopping_.load(std::memory_order_acquire) ||
+                           batch_abort.stop_requested() || is_job_cancel_requested(job_id);
+                };
+                auto result = chat->chat_completion_stream(parts->messages, parts->sampling,
+                                                           /*on_token=*/{}, is_cancelled);
+                if (!result) return std::unexpected(result.error().message);
+                lcpp::ChatFinal cf;
+                fill_chat_final(&cf, *result, /*include_message=*/true);
+                return cf;
+            };
+            auto finals =
+                run_batch_items(static_cast<std::size_t>(items.size()), max_conc, run_item);
+            clear_job_cancel(job_id);
+            if (!finals) {
+                return terminal_error(job_id, "BatchChat item " +
+                                                  std::to_string(finals.error().index) + ": " +
+                                                  finals.error().error);
+            }
+
+            lcpp::JobChunk chunk;
+            auto* br = chunk.mutable_batch_chat();
+            br->set_id(monotonic_id("cpp-bchat-"));
+            // Index-aligned with BatchChatJob.items (wire contract);
+            // run_batch_items returns them in input order.
+            for (auto& cf : *finals) *br->add_items() = std::move(cf);
+
+            auto out = std::make_unique<pb::WorkerMessage>();
+            auto* jr = out->mutable_job_result();
+            jr->set_job_id(job_id);
+            chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
+            return out;
+        }
+        case lcpp::JOB_KIND_TOKENIZE: {
+            if (!chat) return terminal_error(job_id, "Tokenize: not a chat model");
+            auto tokens = chat->tokenize(decoded.tokenize().text(), /*add_special=*/true);
+            if (!tokens) return terminal_error(job_id, "Tokenize: " + tokens.error().message);
+
+            lcpp::JobChunk chunk;
+            auto* tr = chunk.mutable_tokenize();
+            for (auto t : *tokens) tr->add_tokens(t);
+
+            auto out = std::make_unique<pb::WorkerMessage>();
+            auto* jr = out->mutable_job_result();
+            jr->set_job_id(job_id);
+            chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
+            return out;
+        }
+        default:
+            return terminal_error(job_id, "AssignJob: unknown job kind");
+    }
 }
 
 std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMessage& job,
@@ -549,248 +855,7 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
                 return terminal_error(job_id, "AssignJob: model not loaded: " + mid);
             }
 
-            lcpp::Job decoded;
-            if (!decoded.ParseFromString(aj.payload())) {
-                return terminal_error(job_id, "AssignJob: invalid payload encoding");
-            }
-
-            // Active accounting: a single-item job holds one job-scoped
-            // guard. Batch jobs occupy up to pool_size() context slots at
-            // once, so each in-flight item holds its own guard instead — a
-            // job-scoped guard would report active=1 while N slots run, and
-            // the heartbeat's pool − active would over-advertise capacity
-            // by N−1, inviting over-dispatch from MASS. With per-item
-            // guards, `active` equals slots actually in use (and the
-            // heartbeat's active_jobs counts in-flight items, not jobs).
-            const bool per_item_active = decoded.kind() == lcpp::JOB_KIND_BATCH_CHAT ||
-                                         decoded.kind() == lcpp::JOB_KIND_BATCH_EMBED;
-            std::optional<ActiveGuard> job_guard;
-            if (!per_item_active) {
-                job_guard.emplace(active_mu_, active_per_model_, active_total_, mid);
-            }
-
-            switch (decoded.kind()) {
-                case lcpp::JOB_KIND_CHAT: {
-                    if (!chat) return terminal_error(job_id, "Chat: not a chat model");
-                    auto parts = to_chat_request(decoded.chat());
-                    if (!parts) return terminal_error(job_id, "Chat: " + parts.error());
-
-                    const bool streaming = decoded.chat().stream();
-
-                    // For streaming, emit per-token JobChunks as they're
-                    // generated. The terminal frame still ships the final
-                    // chat_final with usage + finish_reason; its `message`
-                    // is left empty since the body already streamed.
-                    //
-                    // A failed Write means MASS is gone (restart, dropped
-                    // stream): nothing downstream can receive the result, so
-                    // generating further tokens only burns the GPU until
-                    // max_tokens. The flag folds into is_cancelled below —
-                    // both lambdas run on this job's generation thread, so a
-                    // plain bool suffices.
-                    bool emit_failed = false;
-                    ChatModel::OnTokenFn on_token;
-                    if (streaming) {
-                        on_token = [&](std::string_view piece) {
-                            if (emit_failed) return;
-                            lcpp::JobChunk delta;
-                            auto* cc = delta.mutable_chat();
-                            cc->set_role(lcpp::ROLE_ASSISTANT);
-                            cc->set_content(std::string(piece));
-                            pb::WorkerMessage msg;
-                            auto* jr = msg.mutable_job_result();
-                            jr->set_job_id(job_id);
-                            delta.SerializeToString(jr->mutable_chunk());
-                            if (!emit(msg)) {
-                                emit_failed = true;
-                                spdlog::warn(
-                                    "streaming write failed job_id={} — cancelling generation",
-                                    job_id);
-                            }
-                        };
-                    }
-
-                    // Cancellation: chat_completion_stream polls this
-                    // function between sampler steps. The set is shared
-                    // across all execute() calls, keyed by job_id, so
-                    // multiple in-flight jobs each see only their own
-                    // cancel signal. A worker-wide stop cancels everything,
-                    // and a failed streaming write cancels this job.
-                    auto is_cancelled = [this, &job_id, &emit_failed]() {
-                        return stopping_.load(std::memory_order_acquire) || emit_failed ||
-                               is_job_cancel_requested(job_id);
-                    };
-                    auto result = chat->chat_completion_stream(parts->messages, parts->sampling,
-                                                               on_token, is_cancelled);
-                    // Always clear the cancel marker after the call —
-                    // even on success, in case HubCancelJob arrived after
-                    // the job completed naturally. Stale entries would
-                    // never auto-clear otherwise.
-                    clear_job_cancel(job_id);
-                    if (!result) {
-                        // Cancellation flows the same way as any other
-                        // error: a terminal frame carrying the message
-                        // text. MASS tells the operator-induced case
-                        // apart by its own cancel-intent marker, not by
-                        // the wire string, so we keep the existing
-                        // "Chat: " prefix for consistency with real
-                        // failures.
-                        return terminal_error(job_id, "Chat: " + result.error().message);
-                    }
-
-                    // Build the terminal JobChunk → encode into
-                    // WorkerJobResult.completed.
-                    lcpp::JobChunk chunk;
-                    fill_chat_final(chunk.mutable_chat_final(), *result,
-                                    /*include_message=*/!streaming);
-
-                    auto out = std::make_unique<pb::WorkerMessage>();
-                    auto* jr = out->mutable_job_result();
-                    jr->set_job_id(job_id);
-                    chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
-                    return out;
-                }
-                case lcpp::JOB_KIND_EMBED: {
-                    if (!embed) return terminal_error(job_id, "Embed: not an embedding model");
-                    auto is_cancelled = [this, &job_id]() {
-                        return stopping_.load(std::memory_order_acquire) ||
-                               is_job_cancel_requested(job_id);
-                    };
-                    auto vec = embed->embed(decoded.embed().input(), is_cancelled);
-                    clear_job_cancel(job_id);
-                    if (!vec) return terminal_error(job_id, "Embed: " + vec.error().message);
-
-                    lcpp::JobChunk chunk;
-                    auto* er = chunk.mutable_embed();
-                    er->set_id(
-                        "cpp-emb-" +
-                        std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now().time_since_epoch())
-                                           .count()));
-                    for (float v : *vec) er->add_embedding(v);
-
-                    auto out = std::make_unique<pb::WorkerMessage>();
-                    auto* jr = out->mutable_job_result();
-                    jr->set_job_id(job_id);
-                    chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
-                    return out;
-                }
-                case lcpp::JOB_KIND_BATCH_EMBED: {
-                    if (!embed) return terminal_error(job_id, "BatchEmbed: not an embedding model");
-                    const auto& inputs = decoded.batch_embed().inputs();
-
-                    // Inputs fan out across the model's context pool; more
-                    // threads than slots would only pile up in acquire_ctx.
-                    const auto max_conc = std::min<std::size_t>(
-                        static_cast<std::size_t>(inputs.size()),
-                        static_cast<std::size_t>(std::max<int32_t>(1, embed->pool_size())));
-                    auto run_item = [&](std::size_t i, std::stop_token batch_abort)
-                        -> std::expected<std::vector<float>, std::string> {
-                        ActiveGuard item_guard(active_mu_, active_per_model_, active_total_, mid);
-                        auto is_cancelled = [&]() {
-                            return stopping_.load(std::memory_order_acquire) ||
-                                   batch_abort.stop_requested() || is_job_cancel_requested(job_id);
-                        };
-                        auto vec = embed->embed(inputs[static_cast<int>(i)], is_cancelled);
-                        if (!vec) return std::unexpected(vec.error().message);
-                        return std::move(*vec);
-                    };
-                    auto vecs = run_batch_items(static_cast<std::size_t>(inputs.size()), max_conc,
-                                                run_item);
-                    clear_job_cancel(job_id);
-                    if (!vecs) {
-                        return terminal_error(job_id, "BatchEmbed item " +
-                                                          std::to_string(vecs.error().index) +
-                                                          ": " + vecs.error().error);
-                    }
-
-                    lcpp::JobChunk chunk;
-                    auto* br = chunk.mutable_batch_embed();
-                    br->set_id(monotonic_id("cpp-bemb-"));
-                    for (std::size_t i = 0; i < vecs->size(); ++i) {
-                        auto* item = br->add_items();
-                        item->set_index(static_cast<int32_t>(i));
-                        for (float v : (*vecs)[i]) item->add_embedding(v);
-                    }
-
-                    auto out = std::make_unique<pb::WorkerMessage>();
-                    auto* jr = out->mutable_job_result();
-                    jr->set_job_id(job_id);
-                    chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
-                    return out;
-                }
-                case lcpp::JOB_KIND_BATCH_CHAT: {
-                    if (!chat) return terminal_error(job_id, "BatchChat: not a chat model");
-                    const auto& items = decoded.batch_chat().items();
-                    if (items.empty())
-                        return terminal_error(job_id, "BatchChat: items must be non-empty");
-
-                    // Items fan out across the model's context pool (see
-                    // max_conc rationale on the batch-embed case). The whole
-                    // batch is still one job: a single cancel aborts every
-                    // item, and the first item failure stops the remainder
-                    // via the batch stop_token. No per-token streaming for
-                    // batch chat.
-                    const auto max_conc = std::min<std::size_t>(
-                        static_cast<std::size_t>(items.size()),
-                        static_cast<std::size_t>(std::max<int32_t>(1, chat->pool_size())));
-                    auto run_item = [&](std::size_t i, std::stop_token batch_abort)
-                        -> std::expected<lcpp::ChatFinal, std::string> {
-                        auto parts = to_chat_request(items[static_cast<int>(i)]);
-                        if (!parts) return std::unexpected(parts.error());
-                        ActiveGuard item_guard(active_mu_, active_per_model_, active_total_, mid);
-                        auto is_cancelled = [&]() {
-                            return stopping_.load(std::memory_order_acquire) ||
-                                   batch_abort.stop_requested() || is_job_cancel_requested(job_id);
-                        };
-                        auto result = chat->chat_completion_stream(parts->messages, parts->sampling,
-                                                                   /*on_token=*/{}, is_cancelled);
-                        if (!result) return std::unexpected(result.error().message);
-                        lcpp::ChatFinal cf;
-                        fill_chat_final(&cf, *result, /*include_message=*/true);
-                        return cf;
-                    };
-                    auto finals =
-                        run_batch_items(static_cast<std::size_t>(items.size()), max_conc, run_item);
-                    clear_job_cancel(job_id);
-                    if (!finals) {
-                        return terminal_error(job_id, "BatchChat item " +
-                                                          std::to_string(finals.error().index) +
-                                                          ": " + finals.error().error);
-                    }
-
-                    lcpp::JobChunk chunk;
-                    auto* br = chunk.mutable_batch_chat();
-                    br->set_id(monotonic_id("cpp-bchat-"));
-                    // Index-aligned with BatchChatJob.items (wire contract);
-                    // run_batch_items returns them in input order.
-                    for (auto& cf : *finals) *br->add_items() = std::move(cf);
-
-                    auto out = std::make_unique<pb::WorkerMessage>();
-                    auto* jr = out->mutable_job_result();
-                    jr->set_job_id(job_id);
-                    chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
-                    return out;
-                }
-                case lcpp::JOB_KIND_TOKENIZE: {
-                    if (!chat) return terminal_error(job_id, "Tokenize: not a chat model");
-                    auto tokens = chat->tokenize(decoded.tokenize().text(), /*add_special=*/true);
-                    if (!tokens)
-                        return terminal_error(job_id, "Tokenize: " + tokens.error().message);
-
-                    lcpp::JobChunk chunk;
-                    auto* tr = chunk.mutable_tokenize();
-                    for (auto t : *tokens) tr->add_tokens(t);
-
-                    auto out = std::make_unique<pb::WorkerMessage>();
-                    auto* jr = out->mutable_job_result();
-                    jr->set_job_id(job_id);
-                    chunk.SerializeToString(jr->mutable_completed()->mutable_final_response());
-                    return out;
-                }
-                default:
-                    return terminal_error(job_id, "AssignJob: unknown job kind");
-            }
+            return run_job(chat, embed, mid, job_id, aj.payload(), emit);
         }
 
         case HM::kCancelJob: {
@@ -1014,6 +1079,9 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
             return out;
         }
 
+        case HM::kModelBenchmark:
+            return run_model_benchmark(job.model_benchmark());
+
         case HM::kEnrolled:
             // WorkerEnrolled is the enrollment handshake's job, consumed by the
             // runner before the receive loop starts. It must never reach here on
@@ -1030,6 +1098,118 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
     }
     spdlog::error("dropping HubMessage with unknown msg case {}", static_cast<int>(job.msg_case()));
     return nullptr;
+}
+
+std::unique_ptr<pb::WorkerMessage> WorkerService::run_model_benchmark(
+    const pb::HubModelBenchmark& req) {
+    const std::string& mid = req.model_id();
+    spdlog::info("model benchmark starting model_id={} files={} cost={}", mid, req.files_size(),
+                 req.cost());
+
+    lcpp::LoadHints hints;
+    if (!hints.ParseFromString(req.load_hints())) {
+        return bench_failure(mid, pb::MODEL_BENCHMARK_FAILURE_KIND_TRANSIENT,
+                             "ModelBenchmark: invalid load_hints encoding");
+    }
+
+    // No enabled devices is an operator state, not a verdict on the model
+    // — MASS must be free to re-bench once a device is re-enabled.
+    auto whitelist = allowed_load_devices();
+    if (whitelist.ids.empty()) {
+        return bench_failure(mid, pb::MODEL_BENCHMARK_FAILURE_KIND_TRANSIENT,
+                             "ModelBenchmark: no devices enabled for model loads");
+    }
+
+    // The files stay on disk afterwards: a bench is how a model reaches
+    // this worker's cache, so the next load for it is a warm one. They
+    // leave only via HubDeleteCacheFiles.
+    std::vector<ModelFile> files;
+    for (const auto& f : req.files()) files.push_back(to_fetch_file(f));
+    auto fetch_cancelled = [this]() { return fetch_cancel_.load(std::memory_order_acquire); };
+    auto fetched = fetcher_.fetch_all(files, fetch_cancelled);
+    if (!fetched) {
+        return bench_failure(mid, pb::MODEL_BENCHMARK_FAILURE_KIND_TRANSIENT,
+                             "ModelBenchmark: " + fetched.error().message);
+    }
+    auto by_role = group_by_role(*fetched, req.files());
+
+    // Memory floor to measure base_bytes against. MASS clears the device
+    // set of idle residents before benching, so this reads the device's
+    // own baseline rather than another model's footprint.
+    const auto before_load = device_mem_snapshot(memory_tracked_devices(whitelist.devices));
+
+    std::shared_ptr<ChatModel> chat;
+    std::shared_ptr<EmbeddingModel> embed;
+    if (hints.kind() == lcpp::LOAD_KIND_EMBEDDING) {
+        auto cfg = to_embed_load_cfg(hints, by_role, default_vram_headroom_pct_);
+        cfg.max_concurrent = 1;  // the bench prices the first slot, then one more
+        cfg.allowed_devices = whitelist.devices;
+        cfg.device_ids = whitelist.ids;
+        auto loaded = EmbeddingModel::load(std::move(cfg));
+        if (!loaded) {
+            return bench_failure(mid, classify_load_failure(loaded.error()),
+                                 "ModelBenchmark(embed): " + loaded.error().message);
+        }
+        embed = std::move(*loaded);
+    } else {
+        auto cfg = to_chat_load_cfg(hints, by_role, default_vram_headroom_pct_);
+        cfg.max_concurrent = 1;
+        cfg.allowed_devices = whitelist.devices;
+        cfg.device_ids = whitelist.ids;
+        auto loaded = ChatModel::load(std::move(cfg));
+        if (!loaded) {
+            return bench_failure(mid, classify_load_failure(loaded.error()),
+                                 "ModelBenchmark(chat): " + loaded.error().message);
+        }
+        chat = std::move(*loaded);
+    }
+
+    // Streaming chunks are dropped: the bench's job_id is synthetic, so a
+    // chunk frame would be unroutable on the MASS side. Returning true
+    // keeps a streaming payload from reading the drop as a lost stream
+    // and cancelling itself.
+    const EmittedFn drop = [](const pb::WorkerMessage&) { return true; };
+    const std::string job_id = monotonic_id("bench-");
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = run_job(chat, embed, mid, job_id, req.payload(), drop);
+    const double elapsed_secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!result || result->job_result().has_error()) {
+        const std::string msg = result ? result->job_result().error().message()
+                                       : std::string("payload produced no terminal frame");
+        return bench_failure(mid, classify_bench_failure(msg, /*context_alloc_failed=*/false),
+                             "ModelBenchmark: " + msg);
+    }
+
+    const ModelBenchProbe probe =
+        chat ? chat->bench_probe(before_load) : embed->bench_probe(before_load);
+    // Unload before replying: MASS lifts this worker's dispatch gate on
+    // the reply frame, and the next load must not race the bench's own.
+    chat.reset();
+    embed.reset();
+
+    if (!(probe.graph_secs > 0)) {
+        // MASS divides a pool-size budget by graph_secs; a zero would be
+        // a silent misconfiguration rather than a measurement.
+        return bench_failure(mid, pb::MODEL_BENCHMARK_FAILURE_KIND_TRANSIENT,
+                             "ModelBenchmark: calibration decode failed");
+    }
+
+    spdlog::info(
+        "model benchmark done model_id={} elapsed={:.3f}s graph={:.3f}s base={} MiB per_slot={} "
+        "MiB",
+        mid, elapsed_secs, probe.graph_secs, probe.base_bytes / (1024LL * 1024),
+        probe.per_slot_bytes / (1024LL * 1024));
+
+    auto out = std::make_unique<pb::WorkerMessage>();
+    auto* mb = out->mutable_model_benchmark();
+    mb->set_model_id(mid);
+    auto* m = mb->mutable_measurements();
+    m->set_elapsed_secs(elapsed_secs);
+    m->set_graph_secs(probe.graph_secs);
+    m->set_base_bytes(probe.base_bytes);
+    m->set_per_slot_bytes(probe.per_slot_bytes);
+    return out;
 }
 
 void WorkerService::delete_cache_files(const std::vector<std::string>& filenames) {

@@ -66,12 +66,8 @@ int32_t auto_ceiling_from_graph_time(double graph_seconds) {
     return std::clamp(fit, 1, kAutoGrowSlotsCap);
 }
 
-namespace {
-
-// The devices whose memory the watermark tracks: the operator's whitelist
-// when set, otherwise every GPU/IGPU backend llama.cpp enumerated
-// (matching the mparams.devices == null case where it may use any).
-std::vector<ggml_backend_dev_t> headroom_devices(const std::vector<ggml_backend_dev_t>& allowed) {
+std::vector<ggml_backend_dev_t> memory_tracked_devices(
+    const std::vector<ggml_backend_dev_t>& allowed) {
     if (!allowed.empty()) return allowed;
     std::vector<ggml_backend_dev_t> out;
     const std::size_t n = ggml_backend_dev_count();
@@ -88,7 +84,7 @@ std::vector<ggml_backend_dev_t> headroom_devices(const std::vector<ggml_backend_
     return out;
 }
 
-std::vector<DevMemSnap> snapshot(const std::vector<ggml_backend_dev_t>& devices) {
+std::vector<DevMemSnap> device_mem_snapshot(const std::vector<ggml_backend_dev_t>& devices) {
     std::vector<DevMemSnap> out;
     out.reserve(devices.size());
     for (ggml_backend_dev_t dev : devices) {
@@ -103,6 +99,8 @@ std::vector<DevMemSnap> snapshot(const std::vector<ggml_backend_dev_t>& devices)
     }
     return out;
 }
+
+namespace {
 
 // Allocate one context. Backends may signal OOM by returning null OR by
 // throwing (ggml-vulkan surfaces vk::OutOfDeviceMemoryError) — both mean
@@ -122,12 +120,23 @@ LlamaContextPtr try_alloc(llama_model* model, const llama_context_params& cparam
     }
 }
 
-// Time one calibration graph — a full-ubatch decode — on the freshly
-// allocated slot 0. Two passes, keeping the faster: the first pass pays
-// one-time backend costs (Vulkan pipeline compilation) that in-flight
-// traffic never pays again, and folding them in would understate the
-// ceiling. nullopt when the decode fails or throws — the measurement
-// can't be trusted, and neither can concurrency on this context.
+// Aggregate positive per-device growth between two snapshots — the same
+// delta rule CtxPoolHeadroom::record folds per device, collapsed to the
+// scalar MASS's memory gate stores. A device the backend can't report
+// (total == 0) contributes nothing rather than a bogus number.
+std::int64_t growth_bytes(const std::vector<DevMemSnap>& before,
+                          const std::vector<DevMemSnap>& after) {
+    std::int64_t total = 0;
+    const std::size_t n = std::min(before.size(), after.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        if (after[i].total == 0) continue;
+        total += std::max<std::int64_t>(0, after[i].used - before[i].used);
+    }
+    return total;
+}
+
+}  // namespace
+
 std::optional<double> time_calibration_graph(llama_context* ctx, const llama_model* model) {
     const uint32_t n = std::min(llama_n_ubatch(ctx), llama_n_ctx(ctx));
     if (n == 0) return std::nullopt;
@@ -156,7 +165,40 @@ std::optional<double> time_calibration_graph(llama_context* ctx, const llama_mod
     return best;
 }
 
-}  // namespace
+ModelBenchProbe probe_model_bench(llama_model* model, llama_context* ctx,
+                                  const llama_context_params& cparams,
+                                  const std::vector<ggml_backend_dev_t>& allowed_devices,
+                                  const std::vector<DevMemSnap>& before_load) {
+    ModelBenchProbe out;
+    if (const auto secs = time_calibration_graph(ctx, model)) out.graph_secs = *secs;
+
+    // Read base AFTER the calibration decode, not straight off the load:
+    // the first graph is what makes the backend commit its compute
+    // buffers and pipelines, and those are part of what a resident model
+    // costs. Measuring before them would under-report base on every
+    // device and leave the per-slot delta carrying a one-off cost.
+    const auto devices = memory_tracked_devices(allowed_devices);
+    const auto warm = device_mem_snapshot(devices);
+    out.base_bytes = growth_bytes(before_load, warm);
+
+    std::string alloc_err;
+    LlamaContextPtr probe = try_alloc(model, cparams, /*probing=*/true, &alloc_err);
+    if (!probe) {
+        // A second slot that doesn't fit is a measurement MASS can still
+        // use, as long as it isn't 0 — that would read as "slots are
+        // free" and let the memory gate size an unloadable pool. Pricing
+        // a slot at the whole load is the safe overstatement: it pins
+        // this pair to a single slot wherever the load only just fits.
+        out.per_slot_bytes = out.base_bytes;
+        spdlog::info(
+            "model bench: second pool slot did not allocate ({}) — pricing a slot at the "
+            "whole load ({} MiB)",
+            alloc_err.empty() ? "no detail" : alloc_err, out.per_slot_bytes / (1024LL * 1024));
+        return out;
+    }
+    out.per_slot_bytes = growth_bytes(warm, device_mem_snapshot(devices));
+    return out;
+}
 
 std::expected<std::vector<LlamaContextPtr>, std::string> grow_ctx_pool(
     llama_model* model, const llama_context_params& cparams, const CtxPoolGrowOptions& opts) {
@@ -164,17 +206,18 @@ std::expected<std::vector<LlamaContextPtr>, std::string> grow_ctx_pool(
     const bool pinned = opts.max_concurrent > 0;
     int32_t ceiling = pinned ? opts.max_concurrent : kAutoGrowSlotsCap;
 
-    const auto devices = headroom_devices(opts.allowed_devices);
+    const auto devices = memory_tracked_devices(opts.allowed_devices);
     const bool headroom_enabled = !pinned && !devices.empty();
     const bool cache_wired = !opts.calib_cache_file.empty() && !opts.calib_key.empty();
 
-    CtxPoolHeadroom headroom(static_cast<double>(headroom_pct) / 100.0,
-                             headroom_enabled ? snapshot(devices) : std::vector<DevMemSnap>{});
+    CtxPoolHeadroom headroom(
+        static_cast<double>(headroom_pct) / 100.0,
+        headroom_enabled ? device_mem_snapshot(devices) : std::vector<DevMemSnap>{});
 
     std::vector<LlamaContextPtr> pool;
     while (std::cmp_less(pool.size(), ceiling)) {
         if (headroom_enabled) {
-            const auto cur = snapshot(devices);
+            const auto cur = device_mem_snapshot(devices);
             if (const auto stop = headroom.predict(cur)) {
                 spdlog::info(
                     "VRAM headroom predicted reach on device {} at slot {} (current {:.1f}% + {} "
@@ -236,7 +279,7 @@ std::expected<std::vector<LlamaContextPtr>, std::string> grow_ctx_pool(
 
         std::optional<CtxPoolHeadroom::Stop> crossed;
         if (headroom_enabled) {
-            crossed = headroom.record(snapshot(devices));
+            crossed = headroom.record(device_mem_snapshot(devices));
         }
         // Persist a fresh measurement only after record(): the worst-slot
         // deltas include the calibration decode's growth only then.

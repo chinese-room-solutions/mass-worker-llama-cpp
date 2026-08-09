@@ -88,6 +88,52 @@ private:
     std::vector<std::int64_t> worst_slot_delta_;
 };
 
+// The devices whose memory a load is accounted against: the operator's
+// whitelist when set, otherwise every GPU/IGPU backend device llama.cpp
+// enumerated (matching the mparams.devices == null case, where a load may
+// land on any of them).
+[[nodiscard]] std::vector<ggml_backend_dev_t> memory_tracked_devices(
+    const std::vector<ggml_backend_dev_t>& allowed);
+
+// One memory reading per device, in the given order. A device whose
+// backend can't report usage comes back as {0, 0}.
+[[nodiscard]] std::vector<DevMemSnap> device_mem_snapshot(
+    const std::vector<ggml_backend_dev_t>& devices);
+
+// Time one calibration graph — a full-ubatch decode — on ctx. Two passes,
+// keeping the faster: the first pass pays one-time backend costs (Vulkan
+// pipeline compilation) that in-flight traffic never pays again, and
+// folding them in would overstate the graph. nullopt when the decode
+// fails or throws — the measurement can't be trusted, and neither can
+// concurrency on this context.
+[[nodiscard]] std::optional<double> time_calibration_graph(llama_context* ctx,
+                                                           const llama_model* model);
+
+// ModelBenchProbe is what a MASS model benchmark measures on the loaded
+// model itself, beside the payload's wall time: the calibration graph's
+// cost (MASS sizes the context pool from it) and the two memory figures
+// its placement gate spends.
+struct ModelBenchProbe {
+    double graph_secs{0};            // 0 = the calibration decode failed
+    std::int64_t base_bytes{0};      // device growth of the pool-of-1 load
+    std::int64_t per_slot_bytes{0};  // device growth of one extra slot
+};
+
+// probe_model_bench measures a freshly loaded, pool-of-1 model: it times
+// one calibration decode on ctx, then allocates a second context with the
+// same cparams to price a pool slot and frees it again. before_load is
+// the snapshot taken before the model loaded, so base_bytes is the growth
+// from there to the warmed pool-of-1 footprint and base + n·per_slot
+// describes the pool MASS is about to ask for.
+//
+// Both memory readings are whole-device, so the caller must hold the
+// benchmark's exclusivity — a concurrent request on any model would land
+// inside them.
+[[nodiscard]] ModelBenchProbe probe_model_bench(
+    llama_model* model, llama_context* ctx, const llama_context_params& cparams,
+    const std::vector<ggml_backend_dev_t>& allowed_devices,
+    const std::vector<DevMemSnap>& before_load);
+
 // Auto-mode growth (max_concurrent == 0) needs a second ceiling besides
 // memory, because memory misses the real hazard: the GPU executes
 // submissions serially, so with S slots in flight the last fence waits

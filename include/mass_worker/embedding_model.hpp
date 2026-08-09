@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "mass_worker/chat_model.hpp"  // for ModelError + ModelErrorCode
+#include "mass_worker/ctx_pool.hpp"
 #include "mass_worker/llama_handles.hpp"
 
 namespace mass_worker {
@@ -71,6 +72,9 @@ public:
     // populated at load time by WorkerService.
     [[nodiscard]] const std::vector<std::string>& device_ids() const { return cfg_.device_ids; }
 
+    // See ChatModel::bench_probe.
+    [[nodiscard]] ModelBenchProbe bench_probe(const std::vector<DevMemSnap>& before_load);
+
 private:
     explicit EmbeddingModel(EmbeddingModelLoadConfig cfg);
     [[nodiscard]] std::expected<void, ModelError> initialize();
@@ -82,6 +86,8 @@ private:
 
     EmbeddingModelLoadConfig cfg_;
     LlamaModelPtr model_;
+    // See ChatModel::cparams_.
+    llama_context_params cparams_{};
     std::vector<LlamaContextPtr> ctx_pool_;
     int32_t n_embd_{0};
 
