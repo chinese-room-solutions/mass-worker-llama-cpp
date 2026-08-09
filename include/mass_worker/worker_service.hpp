@@ -135,7 +135,7 @@ public:
     // threads where an escaping throw is std::terminate. Exceptions are
     // folded into the message kind's error frame.
     [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage> execute(
-        const mass::v1::worker::HubMessage& job, EmittedFn emit);
+        const mass::v1::worker::HubMessage& job, const EmittedFn& emit);
 
     void delete_cache_files(const std::vector<std::string>& filenames);
 
@@ -174,7 +174,7 @@ public:
 
 private:
     [[nodiscard]] std::unique_ptr<mass::v1::worker::WorkerMessage> execute_impl(
-        const mass::v1::worker::HubMessage& job, EmittedFn emit);
+        const mass::v1::worker::HubMessage& job, const EmittedFn& emit);
 
     // run_job executes one gateway payload against an already-resolved
     // model and returns the terminal WorkerJobResult frame. Exactly one

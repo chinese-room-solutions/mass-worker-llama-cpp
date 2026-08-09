@@ -199,9 +199,12 @@ std::expected<std::vector<LlamaContextPtr>, std::string> grow_ctx_pool(
     // answer) auto growth has nothing that could ever stop it.
     const bool headroom_enabled =
         !pinned && std::ranges::any_of(initial, [](const DevMemSnap& s) { return s.total > 0; });
-    const int32_t ceiling = pinned             ? opts.max_concurrent
-                            : headroom_enabled ? std::numeric_limits<int32_t>::max()
-                                               : 1;
+    int32_t ceiling = 1;
+    if (pinned) {
+        ceiling = opts.max_concurrent;
+    } else if (headroom_enabled) {
+        ceiling = std::numeric_limits<int32_t>::max();
+    }
 
     CtxPoolHeadroom headroom(static_cast<double>(headroom_pct) / 100.0,
                              headroom_enabled ? initial : std::vector<DevMemSnap>{});

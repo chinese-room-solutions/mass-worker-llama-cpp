@@ -535,11 +535,11 @@ private:
 }  // namespace
 
 std::unique_ptr<pb::WorkerMessage> WorkerService::execute(const pb::HubMessage& job,
-                                                          EmittedFn emit) {
+                                                          const EmittedFn& emit) {
     using HM = pb::HubMessage;
     std::unique_ptr<pb::WorkerMessage> out;
     try {
-        out = execute_impl(job, std::move(emit));
+        out = execute_impl(job, emit);
     } catch (const std::exception& e) {
         // llama/ggml surface runtime device OOM as exceptions (ggml-vulkan
         // throws from allocation paths during load and decode), and execute
@@ -832,7 +832,7 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::run_job(
 }
 
 std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMessage& job,
-                                                               EmittedFn emit) {
+                                                               const EmittedFn& emit) {
     using HM = pb::HubMessage;
     switch (job.msg_case()) {
         case HM::kAssignJob: {
