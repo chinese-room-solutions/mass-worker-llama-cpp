@@ -1004,12 +1004,12 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
                 d->set_device_name(r.device_name);
                 d->set_memory_gbs(r.memory_gbs);
                 d->set_load_gbs(r.load_gbs);
-                // Multi-axis throughput map keyed by the runtime's
-                // calibration axis name. For llama-cpp the only required
-                // axis today is "q4k_matvec" — populated from the Q4_K
-                // matvec bench. Additional axes (e.g. "f16_matmul") would
-                // be added here as the worker grows new bench paths.
-                (*d->mutable_throughput())["q4k_matvec"] = r.compute_gflops;
+                // The device's realised rate on the Q4_K matvec workload,
+                // in FLOPS. Cosmetic: MASS shows it so an operator can
+                // compare devices, and schedules from per-model
+                // benchmarks instead. Nothing keys off the workload's
+                // identity any more, so it is reported unlabelled.
+                d->set_flops(r.compute_gflops * 1e9);
             }
             return out;
         }
