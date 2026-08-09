@@ -5,10 +5,10 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <limits>
 #include <utility>
 
 #include "llama.h"
-#include "mass_worker/calib_cache.hpp"
 #include "mass_worker/llama_backend.hpp"
 
 namespace mass_worker {
@@ -31,13 +31,6 @@ std::optional<CtxPoolHeadroom::Stop> CtxPoolHeadroom::predict(
     return tightest;
 }
 
-void CtxPoolHeadroom::seed_worst_deltas(const std::vector<std::int64_t>& deltas) {
-    const std::size_t n = std::min(deltas.size(), worst_slot_delta_.size());
-    for (std::size_t i = 0; i < n; ++i) {
-        worst_slot_delta_[i] = std::max(worst_slot_delta_[i], deltas[i]);
-    }
-}
-
 std::optional<CtxPoolHeadroom::Stop> CtxPoolHeadroom::record(const std::vector<DevMemSnap>& cur) {
     const std::size_t n = std::min(cur.size(), prev_.size());
     for (std::size_t i = 0; i < n; ++i) {
@@ -58,12 +51,6 @@ std::optional<CtxPoolHeadroom::Stop> CtxPoolHeadroom::record(const std::vector<D
         }
     }
     return worst;
-}
-
-int32_t auto_ceiling_from_graph_time(double graph_seconds) {
-    if (!(graph_seconds > 0)) return 1;
-    const auto fit = static_cast<int32_t>(kQueueBudgetSeconds / graph_seconds);
-    return std::clamp(fit, 1, kAutoGrowSlotsCap);
 }
 
 std::vector<ggml_backend_dev_t> memory_tracked_devices(
@@ -204,15 +191,20 @@ std::expected<std::vector<LlamaContextPtr>, std::string> grow_ctx_pool(
     llama_model* model, const llama_context_params& cparams, const CtxPoolGrowOptions& opts) {
     const int32_t headroom_pct = std::clamp(opts.vram_headroom_pct, 1, 100);
     const bool pinned = opts.max_concurrent > 0;
-    int32_t ceiling = pinned ? opts.max_concurrent : kAutoGrowSlotsCap;
 
     const auto devices = memory_tracked_devices(opts.allowed_devices);
-    const bool headroom_enabled = !pinned && !devices.empty();
-    const bool cache_wired = !opts.calib_cache_file.empty() && !opts.calib_key.empty();
+    const auto initial = device_mem_snapshot(devices);
+    // The watermark can only fire on a device whose usage the backend
+    // reports; with none (CPU-only placement, or a backend that can't
+    // answer) auto growth has nothing that could ever stop it.
+    const bool headroom_enabled =
+        !pinned && std::ranges::any_of(initial, [](const DevMemSnap& s) { return s.total > 0; });
+    const int32_t ceiling = pinned             ? opts.max_concurrent
+                            : headroom_enabled ? std::numeric_limits<int32_t>::max()
+                                               : 1;
 
-    CtxPoolHeadroom headroom(
-        static_cast<double>(headroom_pct) / 100.0,
-        headroom_enabled ? device_mem_snapshot(devices) : std::vector<DevMemSnap>{});
+    CtxPoolHeadroom headroom(static_cast<double>(headroom_pct) / 100.0,
+                             headroom_enabled ? initial : std::vector<DevMemSnap>{});
 
     std::vector<LlamaContextPtr> pool;
     while (std::cmp_less(pool.size(), ceiling)) {
@@ -248,45 +240,9 @@ std::expected<std::vector<LlamaContextPtr>, std::string> grow_ctx_pool(
         }
         pool.push_back(std::move(ctx));
 
-        // Calibrate before headroom.record so slot 0's delta includes the
-        // compute buffers the first decode makes the backend allocate.
-        // A cache hit skips that decode, so the entry's stored deltas are
-        // replayed into the watermark instead.
-        std::optional<double> fresh_secs;
-        if (!pinned && pool.size() == 1) {
-            std::optional<CalibEntry> cached;
-            if (cache_wired) cached = calib_cache_lookup(opts.calib_cache_file, opts.calib_key);
-            if (cached) {
-                ceiling = auto_ceiling_from_graph_time(cached->graph_secs);
-                headroom.seed_worst_deltas(cached->slot_deltas);
-                spdlog::info(
-                    "auto slot ceiling: cached calibration {:.2f}s, queue budget {:.1f}s → {} "
-                    "slots",
-                    cached->graph_secs, kQueueBudgetSeconds, ceiling);
-            } else {
-                fresh_secs = time_calibration_graph(pool.front().get(), model);
-                ceiling = fresh_secs ? auto_ceiling_from_graph_time(*fresh_secs) : 1;
-                if (fresh_secs) {
-                    spdlog::info(
-                        "auto slot ceiling: calibration graph {:.2f}s, queue budget {:.1f}s → {} "
-                        "slots",
-                        *fresh_secs, kQueueBudgetSeconds, ceiling);
-                } else {
-                    spdlog::warn("auto slot ceiling: calibration decode failed → 1 slot");
-                }
-            }
-        }
-
         std::optional<CtxPoolHeadroom::Stop> crossed;
         if (headroom_enabled) {
             crossed = headroom.record(device_mem_snapshot(devices));
-        }
-        // Persist a fresh measurement only after record(): the worst-slot
-        // deltas include the calibration decode's growth only then.
-        if (fresh_secs && cache_wired) {
-            calib_cache_store(
-                opts.calib_cache_file, opts.calib_key,
-                {.graph_secs = *fresh_secs, .slot_deltas = headroom.worst_slot_deltas()});
         }
         if (crossed) {
             spdlog::info(

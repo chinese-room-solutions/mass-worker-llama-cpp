@@ -33,10 +33,6 @@ struct EmbeddingModelLoadConfig {
     // Canonical IDs ("gpu:N" / "cpu:0") of every device this model will
     // actually occupy (see ChatModelLoadConfig::device_ids).
     std::vector<std::string> device_ids;
-
-    // On-disk calibration cache for the auto slot ceiling (see
-    // calib_cache.hpp). Empty → measure on every load.
-    std::filesystem::path calib_cache_file;
 };
 
 struct EmbedPoolSlot;

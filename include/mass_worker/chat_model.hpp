@@ -57,10 +57,6 @@ struct ChatModelLoadConfig {
     // Surfaced unchanged on heartbeat so MASS can score split models by
     // min(GFLOPS) across the placement set.
     std::vector<std::string> device_ids;
-
-    // On-disk calibration cache for the auto slot ceiling (see
-    // calib_cache.hpp). Empty → measure on every load.
-    std::filesystem::path calib_cache_file;
 };
 
 // True when a model restricted to `allowed_devices` may touch a GPU: scans

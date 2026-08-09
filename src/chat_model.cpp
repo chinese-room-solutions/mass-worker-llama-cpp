@@ -10,7 +10,6 @@
 #include <utility>
 #include <vector>
 
-#include "mass_worker/calib_cache.hpp"
 #include "mass_worker/ctx_pool.hpp"
 #include "mass_worker/llama_backend.hpp"
 
@@ -219,15 +218,10 @@ std::expected<void, ModelError> ChatModel::initialize() {
     // dimensions, so a pool that fills the device makes
     // mtmd_helper_eval_chunks OOM mid-request.
     cparams_ = cparams;
-    auto pool =
-        grow_ctx_pool(model_.get(), cparams,
-                      {.max_concurrent = cfg_.max_concurrent,
-                       .vram_headroom_pct = cfg_.vram_headroom_pct,
-                       .allowed_devices = cfg_.allowed_devices,
-                       .calib_cache_file = cfg_.calib_cache_file,
-                       .calib_key = cfg_.calib_cache_file.empty()
-                                        ? std::string{}
-                                        : calib_cache_key(cfg_.path, cparams, cfg_.device_ids)});
+    auto pool = grow_ctx_pool(model_.get(), cparams,
+                              {.max_concurrent = cfg_.max_concurrent,
+                               .vram_headroom_pct = cfg_.vram_headroom_pct,
+                               .allowed_devices = cfg_.allowed_devices});
     if (!pool) {
         mm_.reset();
         templates_.reset();

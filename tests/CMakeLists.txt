@@ -122,22 +122,6 @@ target_compile_features(mass_worker_chat_model_test PRIVATE cxx_std_23)
 mass_worker_warnings(mass_worker_chat_model_test)
 add_test(NAME chat_model COMMAND mass_worker_chat_model_test)
 
-# Calibration-cache tests — key identity + the on-disk store behind the
-# auto-slot-ceiling reuse. Pure file I/O against a temp dir; no model, no
-# GPU; deterministic in CI.
-add_executable(mass_worker_calib_cache_test
-    calib_cache_test.cpp
-)
-target_link_libraries(mass_worker_calib_cache_test
-    PRIVATE
-        mass_worker_lib
-        GTest::gtest
-        GTest::gtest_main
-)
-target_compile_features(mass_worker_calib_cache_test PRIVATE cxx_std_23)
-mass_worker_warnings(mass_worker_calib_cache_test)
-add_test(NAME calib_cache COMMAND mass_worker_calib_cache_test)
-
 # Ctx-pool tests — the pure headroom decision table (CtxPoolHeadroom)
 # behind the grow loop chat + embed pools share. No model load, no GPU;
 # deterministic in CI.

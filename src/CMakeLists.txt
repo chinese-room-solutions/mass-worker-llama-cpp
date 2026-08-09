@@ -120,7 +120,6 @@ add_library(mass_worker_lib STATIC
     cache.cpp
     bench.cpp
     chat_model.cpp
-    calib_cache.cpp
     ctx_pool.cpp
     embedding_model.cpp
     llama_backend.cpp

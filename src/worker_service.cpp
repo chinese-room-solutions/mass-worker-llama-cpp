@@ -16,7 +16,6 @@
 #include "llama-cpp/payload.pb.h"
 #include "mass_worker/batch_runner.hpp"
 #include "mass_worker/bench.hpp"
-#include "mass_worker/calib_cache.hpp"
 #include "mass_worker/version.hpp"
 #include "worker/worker.pb.h"
 
@@ -923,7 +922,6 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
                 auto cfg = to_chat_load_cfg(hints, by_role, default_vram_headroom_pct_);
                 cfg.allowed_devices = std::move(whitelist.devices);
                 cfg.device_ids = std::move(whitelist.ids);
-                cfg.calib_cache_file = std::filesystem::path(models_dir_) / kCalibCacheFilename;
                 spdlog::info("loading chat model id={} path={}", mid, cfg.path.string());
                 auto loaded = ChatModel::load(std::move(cfg));
                 if (!loaded) {
@@ -959,7 +957,6 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
             auto cfg = to_embed_load_cfg(hints, by_role, default_vram_headroom_pct_);
             cfg.allowed_devices = std::move(whitelist.devices);
             cfg.device_ids = std::move(whitelist.ids);
-            cfg.calib_cache_file = std::filesystem::path(models_dir_) / kCalibCacheFilename;
             spdlog::info("loading embedding model id={} path={}", mid, cfg.path.string());
             auto loaded = EmbeddingModel::load(std::move(cfg));
             if (!loaded) {
