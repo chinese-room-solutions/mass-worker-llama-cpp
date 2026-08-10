@@ -4,19 +4,19 @@ name: release
 # target OS and attach the archived binary + raw installer to a single GitHub
 # Release. GPU backend per OS: Metal on Apple Silicon (native), Vulkan
 # elsewhere (cross-vendor). CUDA is a separate opt-in build and is not shipped
-# here. All three build legs (Linux, Windows, macOS) run on self-hosted
-# runners (no billed minutes); only the publish job uses a hosted runner.
-# CI covers the Linux/Vulkan leg alone — Windows and Metal are compiled at
-# release time only.
+# here. All three build legs (Linux, Windows, macOS) run on GitHub-hosted
+# runners; the repo is public, so they cost nothing. CI covers the
+# Linux/Vulkan leg alone — Windows and Metal are compiled at release time
+# only.
 #
-# Mirrors ci.yml's vcpkg + mass-proto setup. Hosted-runner dep-install steps
-# are kept (gated on runner.environment) so a leg can be pointed back at a
-# hosted runner by editing only its matrix entry.
+# Mirrors ci.yml's vcpkg + mass-proto setup. The dep-install steps are gated
+# on `runner.environment == 'github-hosted'`, so a leg can be pointed back at
+# a pre-provisioned self-hosted runner by editing only its matrix entry.
 #
-# DO NOT push a v* tag before every ACTIVE leg's self-hosted runner is
-# registered and online: a leg with no matching runner sits queued (~24h,
-# then fails), and publish (needs: build) never runs — the release keeps
-# stale assets.
+# If you do point a leg back at self-hosted, DO NOT push a v* tag before that
+# runner is registered and ONLINE: a leg with no matching runner sits queued
+# (~24h, then fails), and publish (needs: build) never runs — the release
+# keeps stale assets. That is what stalled 0.2.1.
 
 on:
   push:
@@ -40,8 +40,8 @@ env:
 jobs:
   # project(VERSION ...) is what --version and the hub handshake report; it is
   # not derived from the tag. v0.2.0 shipped with it still at 0.1.0, so the
-  # worker advertised the wrong build. Fails fast on a hosted runner, before
-  # the three self-hosted legs spend an hour compiling.
+  # worker advertised the wrong build. Fails fast, before the three build
+  # legs spend an hour compiling.
   version:
     runs-on: ubuntu-latest
     steps:
@@ -80,25 +80,26 @@ jobs:
           # container) — the join bootstrap fetches and execs it with
           # --non-interactive, so it needs a container-free executable at an
           # evergreen releases/latest/download URL.
-          - os: [self-hosted, Linux, X64]
+          # All three legs run on GitHub-hosted runners. The repo is public, so
+          # they cost nothing, and a release can never stall on a machine
+          # nobody remembered to power on — a leg with no matching runner
+          # queues for ~24h and `publish` (needs: build) never runs, which is
+          # how the 0.2.1 release got stuck. Self-hosted labels
+          # ([self-hosted, Linux, X64] etc.) still work if you want them back:
+          # the dep-install steps below are gated on
+          # `runner.environment == 'github-hosted'` and skip themselves on a
+          # pre-provisioned box.
+          - os: ubuntu-latest
             label: linux-amd64
             triplet: x64-linux-release
             asset: mass-worker-llama-cpp_linux_amd64
             setup_asset: mass-worker-setup_linux_amd64
             dir: mass-worker-llama-cpp
-          # Self-hosted Windows/macOS runners are pre-provisioned (the dep
-          # install steps below are hosted-only). Provision before registering:
-          #   Windows (labels: self-hosted, Windows, X64): VS Build Tools
-          #     (MSVC x64), Ninja, GNU make, 7-Zip, Git for Windows (the
-          #     runner needs git-bash for `shell: bash`), Vulkan SDK with
-          #     VULKAN_SDK set machine-wide (loader + glslc).
-          #   macOS (labels: self-hosted, macOS, ARM64): Xcode command line
-          #     tools, ninja, make, autoconf, automake, libtool.
           # Windows uses the repo's static-md-rel overlay triplet — the same
           # config the local `make package` ships (static deps, dynamic CRT,
           # release-only); the stock x64-windows-static-release (static CRT)
           # has never been built here.
-          - os: [self-hosted, Windows, X64]
+          - os: windows-latest
             label: windows-amd64
             triplet: x64-windows-static-md-rel
             asset: mass-worker-llama-cpp_windows_amd64
@@ -111,7 +112,7 @@ jobs:
             # The runner's own _work/<repo>/<repo> layout already spends the
             # repo name twice, so a third copy here overflows it.
             dir: w
-          - os: [self-hosted, macOS, ARM64]
+          - os: macos-15
             label: macos-arm64
             triplet: arm64-osx-release
             asset: mass-worker-llama-cpp_darwin_arm64
