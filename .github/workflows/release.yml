@@ -171,7 +171,10 @@ jobs:
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: latest
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, glslang, SPIRV-Tools
+          # Capital G. The action's component list is case-sensitive and
+          # upstream renamed `glslang` to `Glslang`; the old spelling fails
+          # configure with "unknown component: glslang".
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools
           vulkan-use-cache: true
 
       # Caches compiled objects for the vendored llama.cpp/ggml tree + our own
