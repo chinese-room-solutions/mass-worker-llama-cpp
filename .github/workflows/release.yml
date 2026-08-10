@@ -38,7 +38,29 @@ env:
   MASS_PROTO_DIR: ${{ github.workspace }}/mass-proto
 
 jobs:
+  # project(VERSION ...) is what --version and the hub handshake report; it is
+  # not derived from the tag. v0.2.0 shipped with it still at 0.1.0, so the
+  # worker advertised the wrong build. Fails fast on a hosted runner, before
+  # the three self-hosted legs spend an hour compiling.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Project version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          project="$(sed -n 's/^[[:space:]]*VERSION[[:space:]]\{1,\}\([0-9][^[:space:]]*\).*/\1/p' CMakeLists.txt | head -1)"
+          if [ "$tag" != "$project" ]; then
+            echo "::error file=CMakeLists.txt::project VERSION '$project' != tag '$tag'; bump CMakeLists.txt before tagging"
+            exit 1
+          fi
+          echo "project VERSION $project matches tag $GITHUB_REF_NAME"
+
   build:
+    needs: version
     name: build (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:

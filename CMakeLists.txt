@@ -22,7 +22,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
 endif()
 
 project(mass-worker-llama-cpp
-    VERSION 0.1.0
+    VERSION 0.2.1
     DESCRIPTION "MASS worker — llama.cpp runtime, native C++"
     LANGUAGES CXX C
 )

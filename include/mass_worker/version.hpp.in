@@ -17,7 +17,7 @@ inline constexpr const char* kVersion = "@PROJECT_VERSION@";
 // worker decodes. MASS rejects a worker whose range doesn't cover the
 // installed runtime. Must track the gateway payload proto compatibility —
 // bump it consciously when the payload proto changes incompatibly.
-inline constexpr const char* kCompatibleRuntimes = ">=0.1 <0.2";
+inline constexpr const char* kCompatibleRuntimes = ">=0.2 <0.3";
 
 // `git describe --tags --dirty --always` at configure time, e.g.
 // "0.1.0-12-gabc1234-dirty". Empty when not a git checkout.
