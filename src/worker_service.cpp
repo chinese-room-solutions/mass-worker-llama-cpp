@@ -273,11 +273,12 @@ std::unique_ptr<pb::WorkerRegister> WorkerService::registration() const {
     // lifetime — MASS's pool-size and wall-clock projections must use it
     // instead of assuming a compiled-in default.
     reg->set_vram_headroom_pct(default_vram_headroom_pct_);
-    // The worker's own semver and the runtime-version range whose payloads it
-    // decodes — MASS rejects a worker whose range doesn't cover the installed
-    // runtime. Both compiled in at build time (version.hpp).
+    // The worker's own semver (MASS joins it against the registry index's
+    // worker rows) and the wire-protocol versions it speaks (MASS picks the
+    // highest common one and rejects an empty intersection). Both compiled in
+    // at build time (version.hpp).
     reg->set_version(kVersion);
-    reg->set_compatible(kCompatibleRuntimes);
+    for (const int32_t v : kProtocolVersions) reg->add_protocol_versions(v);
     for (const auto& d : hardware_.devices()) {
         auto* dev = reg->add_devices();
         dev->set_id(d.id);

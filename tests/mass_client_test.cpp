@@ -127,6 +127,16 @@ INSTANTIATE_TEST_SUITE_P(
                               kSchemaFailure,
                               {"no such table: workers", "(code 13)"},
                               {"token"}},
+        // A refused register frame: the wire-protocol lists don't intersect.
+        // The token is irrelevant, so it must not be mentioned even though one
+        // was held; the server's message names both lists.
+        EnrollmentMessageCase{
+            "failed_precondition_protocol_mismatch",
+            true,
+            grpc::StatusCode::FAILED_PRECONDITION,
+            "worker speaks protocol versions [1], MASS speaks [2 3]",
+            {"rejected the registration", "protocol versions [1]", "[2 3]", "(code 9)"},
+            {"token"}},
         // No message at all: a bare transport close. Report the code and stop —
         // any hypothesis would be invention.
         EnrollmentMessageCase{"empty_message_transport_close",
@@ -143,36 +153,39 @@ INSTANTIATE_TEST_SUITE_P(
                               {"token"}}),
     [](const ::testing::TestParamInfo<EnrollmentMessageCase>& tpi) { return tpi.param.name; });
 
-// --- enrollment_error_is_fatal: exit vs. back off and retry -----------------
+// --- connect_error_is_fatal: exit vs. back off and retry --------------------
 
-struct EnrollmentFatalCase {
+struct ConnectFatalCase {
     std::string name;
     grpc::StatusCode code;
     bool want_fatal;
 };
 
-class EnrollmentFatalTest : public ::testing::TestWithParam<EnrollmentFatalCase> {};
+class ConnectFatalTest : public ::testing::TestWithParam<ConnectFatalCase> {};
 
-TEST_P(EnrollmentFatalTest, Classification) {
+TEST_P(ConnectFatalTest, Classification) {
     const auto& c = GetParam();
-    EXPECT_EQ(mass_worker::enrollment_error_is_fatal(c.code), c.want_fatal);
+    EXPECT_EQ(mass_worker::connect_error_is_fatal(c.code), c.want_fatal);
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Table, EnrollmentFatalTest,
+    Table, ConnectFatalTest,
     ::testing::Values(
         // Only an operator can supply a valid token or a well-formed request;
         // reconnecting with the same inputs would loop forever.
-        EnrollmentFatalCase{"unauthenticated", grpc::StatusCode::UNAUTHENTICATED, true},
-        EnrollmentFatalCase{"permission_denied", grpc::StatusCode::PERMISSION_DENIED, true},
-        EnrollmentFatalCase{"invalid_argument", grpc::StatusCode::INVALID_ARGUMENT, true},
+        ConnectFatalCase{"unauthenticated", grpc::StatusCode::UNAUTHENTICATED, true},
+        ConnectFatalCase{"permission_denied", grpc::StatusCode::PERMISSION_DENIED, true},
+        ConnectFatalCase{"invalid_argument", grpc::StatusCode::INVALID_ARGUMENT, true},
+        // A refused registration: no wire-protocol version in common, or no
+        // such runtime installed. Only a different binary (or server) clears it.
+        ConnectFatalCase{"failed_precondition", grpc::StatusCode::FAILED_PRECONDITION, true},
         // Server-side conditions: fixable while the worker is up, so it should
         // still be there (backing off) when they are.
-        EnrollmentFatalCase{"internal", grpc::StatusCode::INTERNAL, false},
-        EnrollmentFatalCase{"unavailable", grpc::StatusCode::UNAVAILABLE, false},
-        EnrollmentFatalCase{"deadline_exceeded", grpc::StatusCode::DEADLINE_EXCEEDED, false},
-        EnrollmentFatalCase{"unknown", grpc::StatusCode::UNKNOWN, false},
-        EnrollmentFatalCase{"resource_exhausted", grpc::StatusCode::RESOURCE_EXHAUSTED, false}),
-    [](const ::testing::TestParamInfo<EnrollmentFatalCase>& tpi) { return tpi.param.name; });
+        ConnectFatalCase{"internal", grpc::StatusCode::INTERNAL, false},
+        ConnectFatalCase{"unavailable", grpc::StatusCode::UNAVAILABLE, false},
+        ConnectFatalCase{"deadline_exceeded", grpc::StatusCode::DEADLINE_EXCEEDED, false},
+        ConnectFatalCase{"unknown", grpc::StatusCode::UNKNOWN, false},
+        ConnectFatalCase{"resource_exhausted", grpc::StatusCode::RESOURCE_EXHAUSTED, false}),
+    [](const ::testing::TestParamInfo<ConnectFatalCase>& tpi) { return tpi.param.name; });
 
 }  // namespace

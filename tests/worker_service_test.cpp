@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -179,11 +180,13 @@ TEST(RegistrationTest, ReportsEffectiveVramHeadroom) {
     EXPECT_EQ(reg->name(), "bench-box");
     EXPECT_EQ(reg->runtime_name(), "llama-cpp");
     EXPECT_EQ(reg->vram_headroom_pct(), 60);
-    // version + compatible ride the register frame so MASS can reject a
-    // worker whose decodable-runtime range doesn't cover the installed
-    // runtime. Both are compiled in from version.hpp.
+    // version + protocol_versions ride the register frame: MASS joins the
+    // version against the registry index's worker rows, and rejects the
+    // registration outright when no protocol version is in common. Both are
+    // compiled in from version.hpp.
     EXPECT_EQ(reg->version(), mass_worker::kVersion);
-    EXPECT_EQ(reg->compatible(), mass_worker::kCompatibleRuntimes);
+    EXPECT_TRUE(std::ranges::equal(reg->protocol_versions(), mass_worker::kProtocolVersions))
+        << "register frame carries " << reg->protocol_versions_size() << " protocol version(s)";
 }
 
 }  // namespace

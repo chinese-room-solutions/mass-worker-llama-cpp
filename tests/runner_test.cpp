@@ -11,7 +11,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -19,6 +21,7 @@
 #include <vector>
 
 #include "mass_worker/credentials.hpp"
+#include "mass_worker/exit_codes.hpp"
 #include "mass_worker/worker_service.hpp"
 #include "worker/worker.grpc.pb.h"
 
@@ -427,6 +430,66 @@ private:
     std::string worker_id_;
     std::string secret_;
 };
+
+// RejectingMassServer answers the register frame the way the hub does when the
+// two ends share no wire-protocol version: FAILED_PRECONDITION carrying both
+// lists. Nothing the worker can retry its way out of.
+class RejectingMassServer final : public mass::v1::worker::WorkerHub::Service {
+public:
+    grpc::Status Connect(
+        grpc::ServerContext* /*ctx*/,
+        grpc::ServerReaderWriter<mass::v1::worker::HubMessage, mass::v1::worker::WorkerMessage>*
+            stream) override {
+        streams_.fetch_add(1, std::memory_order_relaxed);
+        mass::v1::worker::WorkerMessage msg;
+        stream->Read(&msg);  // the register frame
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "worker speaks protocol versions [1], MASS speaks [2 3]"};
+    }
+
+    [[nodiscard]] std::size_t streams() const { return streams_.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<std::size_t> streams_{0};
+};
+
+TEST(RunnerTest, ExitsFatalWhenTheHubRejectsTheRegistration) {
+    QuietLogs quiet;
+
+    RejectingMassServer service;
+    int port = 0;
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+
+    TempDataDir data_dir;
+    mass_worker::WorkerService svc("llama-test", "test-host", "models");
+
+    mass_worker::RunnerConfig cfg{};
+    cfg.mass_url = "http://127.0.0.1:" + std::to_string(port);
+    cfg.worker_name = "test-host";
+    cfg.models_dir = "models";
+    cfg.data_dir = data_dir.string();
+    // A stored identity: the steady-state path, where the rejection arrives as
+    // the stream's closing status rather than through the enrollment handshake.
+    cfg.worker_id = "wrk_known";
+    cfg.worker_secret = "sec-known";
+    cfg.heartbeat_interval = std::chrono::seconds{60};
+    cfg.reconnect_backoff = std::chrono::milliseconds{50};
+
+    mass_worker::Runner runner(cfg, svc);
+    auto exited = std::async(std::launch::async, [&] { return runner.run(); });
+    if (exited.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        runner.stop();  // don't let the future's destructor hang the suite
+        ADD_FAILURE() << "runner kept reconnecting after a rejected registration";
+    }
+    EXPECT_EQ(exited.get(), mass_worker::kExitFatal);
+    EXPECT_EQ(service.streams(), 1u) << "a rejected registration must not be retried";
+
+    server->Shutdown(std::chrono::system_clock::now());
+    server->Wait();
+}
 
 TEST(RunnerTest, EnrollsThenPersistsAndReconnectsWithSecret) {
     QuietLogs quiet;

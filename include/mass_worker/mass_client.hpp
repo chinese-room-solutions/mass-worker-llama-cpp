@@ -53,13 +53,14 @@ struct ParsedUrl {
 [[nodiscard]] std::string enrollment_failure_message(bool had_token, grpc::StatusCode code,
                                                      std::string_view server_message);
 
-// Whether an enrollment failure with this status is worth reconnecting for.
-// Credential and malformed-request errors need an operator to change something
+// Whether a Connect-stream failure with this status is worth reconnecting for.
+// Credential errors, malformed requests and a refused registration (no common
+// wire-protocol version, no such runtime) need an operator to change something
 // the worker cannot change by retrying, so they end the process; every other
 // code describes a server-side condition that may well be repaired while the
 // worker is up, so the worker backs off and retries instead of exiting. Pure;
 // exposed for testing.
-[[nodiscard]] bool enrollment_error_is_fatal(grpc::StatusCode code);
+[[nodiscard]] bool connect_error_is_fatal(grpc::StatusCode code);
 
 // MassClient owns a long-lived grpc::Channel to MASS plus a worker-hub stub
 // built on top of it. Cheap to construct, cheap to copy the inner stub_;

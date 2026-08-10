@@ -238,7 +238,7 @@ Runner::SessionResult Runner::run_one_session() {
             const auto status = conn.stream->Finish();
             spdlog::error("{}", enrollment_failure_message(had_token, status.error_code(),
                                                            status.error_message()));
-            if (enrollment_error_is_fatal(status.error_code())) {
+            if (connect_error_is_fatal(status.error_code())) {
                 return {.retryable = false, .reached_working_state = false};
             }
             return {.retryable = true, .reached_working_state = false};
@@ -589,6 +589,18 @@ Runner::SessionResult Runner::run_one_session() {
     if (!status.ok()) {
         if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
             spdlog::error("authentication failed: {}", status.error_message());
+            return {.retryable = false,
+                    .reached_working_state = true,
+                    .lifetime = lifetime,
+                    .saw_inbound_message = saw_inbound};
+        }
+        if (connect_error_is_fatal(status.error_code())) {
+            // MASS refused this worker outright — no wire-protocol version in
+            // common (its message carries both lists), no such runtime, a
+            // malformed frame. Reconnecting with the same binary changes
+            // nothing, so exit and let the operator upgrade or fix the server.
+            spdlog::error("MASS rejected the registration: {} (code {})", status.error_message(),
+                          static_cast<int>(status.error_code()));
             return {.retryable = false,
                     .reached_working_state = true,
                     .lifetime = lifetime,

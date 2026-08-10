@@ -74,17 +74,24 @@ std::string enrollment_failure_message(bool had_token, grpc::StatusCode code,
                "or MASS_JOIN_TOKEN)" +
                detail;
     }
+    if (code == grpc::StatusCode::FAILED_PRECONDITION) {
+        // The register frame itself was refused (no common wire-protocol
+        // version, no such runtime installed) — nothing to do with the token,
+        // and the server message names what doesn't line up.
+        return "enrollment failed: MASS rejected the registration" + detail;
+    }
     if (server_message.empty()) {
         return "enrollment failed: MASS closed the stream without replying" + detail;
     }
     return "enrollment failed: MASS rejected the enrollment" + detail;
 }
 
-bool enrollment_error_is_fatal(grpc::StatusCode code) {
+bool connect_error_is_fatal(grpc::StatusCode code) {
     switch (code) {
         case grpc::StatusCode::UNAUTHENTICATED:
         case grpc::StatusCode::PERMISSION_DENIED:
         case grpc::StatusCode::INVALID_ARGUMENT:
+        case grpc::StatusCode::FAILED_PRECONDITION:
             return true;
         default:
             return false;
