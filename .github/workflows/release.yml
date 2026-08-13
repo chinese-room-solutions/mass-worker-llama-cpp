@@ -356,6 +356,17 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
+      # Checksums for install.sh to verify the raw installer it fetches. Names
+      # only (no artifacts/<name>/ prefix), so the entries match the release
+      # asset names the download URL uses.
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \
+            -o -name '*.AppImage' -o -name '*.exe' -o -name 'mass-worker-setup_*' \) \
+            -exec sha256sum {} + | sed 's| .*/| |' | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
           files: |
@@ -364,4 +375,5 @@ jobs:
             artifacts/**/*.AppImage
             artifacts/**/*.exe
             artifacts/**/mass-worker-setup_*
+            SHA256SUMS
           generate_release_notes: true

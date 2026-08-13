@@ -141,6 +141,23 @@ the worker and its runtime libraries as payload, wrapped double-clickable —
 Prebuilt installers ship on the
 [releases page](https://github.com/chinese-room-solutions/mass-worker-llama-cpp/releases).
 
+## Install
+
+On macOS and Linux, fetch and run the installer in one line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chinese-room-solutions/mass-worker-llama-cpp/main/install.sh | sh
+```
+
+This downloads the installer for your platform from the latest release,
+verifies its checksum, and opens the setup wizard. On macOS it also avoids
+Gatekeeper's "Open Anyway" dance — `curl` sets no quarantine attribute, so the
+installer runs straight away, unlike a browser download of the `.app`.
+
+Windows users download `mass-worker-setup_windows_amd64.exe` (or the
+double-clickable installer) from the
+[releases page](https://github.com/chinese-room-solutions/mass-worker-llama-cpp/releases/latest).
+
 ## Run
 
 ```bash
