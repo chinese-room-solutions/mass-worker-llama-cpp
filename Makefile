@@ -16,13 +16,6 @@ BUILD_TYPE ?= Release
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 DIST_DIR ?= dist
 
-# `make package` bundles the raw installer into the host container (AppImage /
-# .app) and, by default, deletes the raw intermediate so a local dist/ shows
-# just the one double-clickable artifact. Set KEEP_RAW_INSTALLER=1 to keep the
-# raw binary beside the container — the release workflow needs it as the
-# non-container executable the join bootstrap fetches and execs.
-KEEP_RAW_INSTALLER ?=
-
 # Resolve the vcpkg toolchain file. The CMakeLists picks it up from
 # $VCPKG_ROOT, but pass it explicitly when that's set so a clean build dir
 # (which has no cached toolchain path) configures without relying on the env
@@ -189,11 +182,9 @@ package: build
 	        --bin "$(DIST_DIR)/$$SETUP_OUT" \
 	        --outdir "$(DIST_DIR)"); \
 	    if [ -n "$$BUNDLE" ] && [ -e "$$BUNDLE" ]; then \
-	        : "The container embeds the installer; drop the raw intermediate so"; \
-	        : "dist/ shows just the one double-clickable artifact — unless"; \
-	        : "KEEP_RAW_INSTALLER is set (the release workflow uploads the raw"; \
-	        : "binary as the join bootstrap's non-container executable)."; \
-	        [ -n "$(KEEP_RAW_INSTALLER)" ] || rm -f "$(DIST_DIR)/$$SETUP_OUT"; \
+	        : "The raw installer stays beside the container: the release uploads"; \
+	        : "it as the join bootstrap's non-container executable, and it is"; \
+	        : "what install.sh fetches."; \
 	        echo "Bundle: $$BUNDLE"; \
 	    else \
 	        echo "warning: bundling produced no artifact; kept $(DIST_DIR)/$$SETUP_OUT" >&2; \

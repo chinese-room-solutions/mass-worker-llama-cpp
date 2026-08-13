@@ -293,13 +293,12 @@ jobs:
       # above and skips reconfiguration, so the Ninja generator + release
       # triplet this job set are untouched (the Makefile's local-dev flags —
       # MSVC toolset pin, static-md-rel overlay triplet — never reach the tree).
-      # KEEP_RAW_INSTALLER=1 stops `make package` from deleting the raw
-      # self-extracting installer after it bundles it into the container, so the
-      # Archive step below can rename + upload it for the join bootstrap.
+      # The raw self-extracting installer stays beside the container; the
+      # Archive step below renames + uploads it for the join bootstrap.
       - name: Package installer
         working-directory: ${{ matrix.dir }}
         shell: bash
-        run: make package KEEP_RAW_INSTALLER=1
+        run: make package
 
       - name: Archive
         working-directory: ${{ matrix.dir }}
