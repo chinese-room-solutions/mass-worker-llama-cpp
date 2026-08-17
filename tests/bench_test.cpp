@@ -24,4 +24,16 @@ TEST(BenchTest, EmptyDeviceIdIsError) {
     EXPECT_EQ(r.error().code, mass_worker::BenchErrorCode::UnknownDevice);
 }
 
+// An already-cancelled bench must come back as Cancelled before it touches a
+// device — a benchmark whose stream is gone has no consumer, and the real
+// phases are tens of seconds of GPU work. Checking a valid device keeps this
+// distinct from the UnknownDevice seam above without running a micro-bench.
+TEST(BenchTest, AlreadyCancelledAbortsBeforeAnyWork) {
+    mass_worker::Hardware hw;
+    ASSERT_FALSE(hw.devices().empty());
+    auto r = mass_worker::bench_one(hw, hw.devices().front().id, [] { return true; });
+    ASSERT_FALSE(r);
+    EXPECT_EQ(r.error().code, mass_worker::BenchErrorCode::Cancelled);
+}
+
 }  // namespace

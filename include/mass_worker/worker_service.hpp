@@ -180,6 +180,15 @@ public:
     // in-flight generation.
     void request_stop();
 
+    // Control-stream lifecycle, driven by the runner: begin_session() when a
+    // stream is serving, end_session() the moment it closes. Work whose only
+    // consumer is that stream — a device benchmark, tens of seconds long and
+    // uncancellable otherwise — polls the flag and aborts, instead of running
+    // to completion to produce a frame nothing can receive. Jobs keep their
+    // own per-job cancellation; this is the session-wide edge.
+    void begin_session();
+    void end_session();
+
     // shutdown stops (request_stop) and releases the loaded models. Called
     // once, after the job threads have drained.
     void shutdown();
@@ -255,6 +264,10 @@ private:
     // so a worker stop cancels in-flight generation instead of letting it
     // run to max_tokens.
     std::atomic<bool> stopping_{false};
+
+    // Set/cleared by begin_session()/end_session(). Starts open so a service
+    // driven without a runner (tests, tools) behaves as if it had a consumer.
+    std::atomic<bool> session_open_{true};
 
     // Per-job cancellation requests from MASS via HubCancelJob, keyed by
     // job_id with the arrival time. chat_completion_stream polls

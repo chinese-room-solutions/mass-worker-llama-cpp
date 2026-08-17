@@ -285,6 +285,7 @@ Runner::SessionResult Runner::run_one_session() {
         spdlog::info("enrolled with MASS: worker_id={}", worker_id_);
     }
     spdlog::info("connected to MASS");
+    service_.begin_session();
 
     // The session is usable from here, so this is where its lifetime starts —
     // not at dial. next_failure_streak weighs that lifetime (and whether any
@@ -559,10 +560,14 @@ Runner::SessionResult Runner::run_one_session() {
     }
 
     // Shut down the dispatch machinery before tearing the session down.
-    // Order matters: flip assign_done + the pool's draining first so
-    // assign workers blocked on a pending load bail out, then drain the
-    // control thread. jthreads join via RAII when their handles go out of
-    // scope (assign_pool first — it was declared last).
+    // Order matters: the stream is gone the instant Read() returns false, so
+    // tell the service FIRST — an in-flight benchmark polls that flag and
+    // aborts, and the join below would otherwise wait out its full run. Then
+    // flip assign_done + the pool's draining so assign workers blocked on a
+    // pending load bail out, then drain the control thread. jthreads join via
+    // RAII when their handles go out of scope (assign_pool first — it was
+    // declared last).
+    service_.end_session();
     assign_done.store(true, std::memory_order_release);
     assign_pool.begin_shutdown();
     pending_cv.notify_all();

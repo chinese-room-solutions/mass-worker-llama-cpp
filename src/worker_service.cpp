@@ -1039,6 +1039,15 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
             const std::string& job_id = b.job_id();
             const std::string& dev_id = b.device_id();
 
+            // A device benchmark is tens of seconds of GPU work with a single
+            // consumer: the control stream that asked for it. Once that stream
+            // is gone (or the worker is stopping) the remaining phases can only
+            // produce an unsendable frame, so abort at the next poll.
+            auto abandoned = [this]() {
+                return stopping_.load(std::memory_order_acquire) ||
+                       !session_open_.load(std::memory_order_acquire);
+            };
+
             // Per-device isolation: one failing device must not discard the
             // devices that already measured — the reply carries the partial
             // results plus an error naming each device that couldn't run.
@@ -1046,7 +1055,7 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
             std::vector<std::string> errors;
             auto run_device = [&](const std::string& id) {
                 try {
-                    if (auto r = bench_one(hardware_, id); r) {
+                    if (auto r = bench_one(hardware_, id, abandoned); r) {
                         results.push_back(std::move(*r));
                     } else {
                         errors.push_back(id + ": " + r.error().message);
@@ -1059,6 +1068,11 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
                 for (const auto& d : hardware_.devices()) run_device(d.id);
             } else {
                 run_device(dev_id);
+            }
+
+            if (abandoned()) {
+                spdlog::info("benchmark abandoned: no live stream job_id={}", job_id);
+                return nullptr;
             }
 
             auto out = std::make_unique<pb::WorkerMessage>();
@@ -1296,6 +1310,14 @@ WorkerService::AllowedDevices WorkerService::allowed_load_devices() const {
 void WorkerService::request_stop() {
     stopping_.store(true, std::memory_order_release);
     fetch_cancel_.store(true, std::memory_order_release);
+}
+
+void WorkerService::begin_session() {
+    session_open_.store(true, std::memory_order_release);
+}
+
+void WorkerService::end_session() {
+    session_open_.store(false, std::memory_order_release);
 }
 
 void WorkerService::shutdown() {

@@ -36,6 +36,15 @@ constexpr auto kPhaseBudget = std::chrono::seconds(2);
 // Slice of a phase the warm-up may spend before the first sample is taken.
 constexpr auto kWarmupBudget = std::chrono::milliseconds(300);
 
+bool cancelled(const BenchCancelledFn& is_cancelled) {
+    return is_cancelled && is_cancelled();
+}
+
+std::unexpected<BenchError> cancel_error(const char* phase) {
+    return std::unexpected(
+        BenchError{BenchErrorCode::Cancelled, std::string(phase) + ": cancelled"});
+}
+
 // A short sample count is still a real measurement, just a noisier one —
 // say so rather than reporting the median as if every sample ran.
 void log_if_truncated(const char* phase, std::size_t got, int want) {
@@ -117,7 +126,8 @@ double median(std::vector<double> v) {
 
 // --- Bandwidth: ggml_add of two large F32 tensors. 3× tensor_bytes per iter
 //     (2 reads + 1 write). Reports peak achievable memory bandwidth in GB/s.
-std::expected<double, BenchError> bench_bandwidth(ggml_backend_dev_t dev) {
+std::expected<double, BenchError> bench_bandwidth(ggml_backend_dev_t dev,
+                                                  const BenchCancelledFn& is_cancelled) {
     constexpr int64_t kNElements = 64LL * 1024 * 1024;  // 256 MB / tensor
 
     auto backend = init_backend(dev);
@@ -170,6 +180,7 @@ std::expected<double, BenchError> bench_bandwidth(ggml_backend_dev_t dev) {
     std::vector<double> samples;
     samples.reserve(kIters);
     for (int i = 0; i < kIters; ++i) {
+        if (cancelled(is_cancelled)) return cancel_error("bandwidth");
         const auto t0 = Clock::now();
         ggml_backend_graph_compute(backend.get(), graph);
         ggml_backend_synchronize(backend.get());
@@ -192,7 +203,8 @@ std::expected<double, BenchError> bench_bandwidth(ggml_backend_dev_t dev) {
 // overlaps with it in practice and is bounded above by storage
 // throughput, so reporting just the upload rate gives MASS a defensible
 // lower bound for the dominant transfer.
-std::expected<double, BenchError> bench_load_bandwidth(ggml_backend_dev_t dev) {
+std::expected<double, BenchError> bench_load_bandwidth(ggml_backend_dev_t dev,
+                                                       const BenchCancelledFn& is_cancelled) {
     constexpr int64_t kNElements = 64LL * 1024 * 1024;  // 256 MB tensor
 
     auto backend = init_backend(dev);
@@ -234,6 +246,7 @@ std::expected<double, BenchError> bench_load_bandwidth(ggml_backend_dev_t dev) {
     std::vector<double> samples;
     samples.reserve(kIters);
     for (int i = 0; i < kIters; ++i) {
+        if (cancelled(is_cancelled)) return cancel_error("load");
         const auto t0 = Clock::now();
         ggml_backend_tensor_set(a, src.data(), 0, tensor_bytes);
         ggml_backend_synchronize(backend.get());
@@ -249,7 +262,8 @@ std::expected<double, BenchError> bench_load_bandwidth(ggml_backend_dev_t dev) {
 // --- Q4_K matmul: 32 chained matmuls (simulating an LLM forward pass) of an
 //     8192×8192 weight against a 8192×1 activation. Reports GFLOPS — directly
 //     comparable across CPU + GPU.
-std::expected<double, BenchError> bench_q4k_matvec(ggml_backend_dev_t dev) {
+std::expected<double, BenchError> bench_q4k_matvec(ggml_backend_dev_t dev,
+                                                   const BenchCancelledFn& is_cancelled) {
     constexpr int64_t kM = 8192;
     constexpr int64_t kK = 8192;
     constexpr int64_t kN = 1;
@@ -308,6 +322,7 @@ std::expected<double, BenchError> bench_q4k_matvec(ggml_backend_dev_t dev) {
         ggml_backend_tensor_set(x0, host_x.data(), 0, ggml_nbytes(x0));
     }
     ggml_backend_synchronize(backend.get());
+    if (cancelled(is_cancelled)) return cancel_error("compute");
 
     // Warm to thermal steady state, bounded: 20 graphs cost 2.7 s on a slow
     // iGPU, before a single sample is taken. The last warm-up graph also
@@ -343,6 +358,7 @@ std::expected<double, BenchError> bench_q4k_matvec(ggml_backend_dev_t dev) {
     std::vector<double> samples;
     samples.reserve(kNSamples);
     for (int i = 0; i < kNSamples; ++i) {
+        if (cancelled(is_cancelled)) return cancel_error("compute");
         const auto t0 = Clock::now();
         for (int r = 0; r < reps; ++r) {
             ggml_backend_graph_compute(backend.get(), graph);
@@ -360,7 +376,8 @@ std::expected<double, BenchError> bench_q4k_matvec(ggml_backend_dev_t dev) {
 }  // namespace
 
 std::expected<BenchResult, BenchError> bench_one(const Hardware& hardware,
-                                                 const std::string& device_id) {
+                                                 const std::string& device_id,
+                                                 const BenchCancelledFn& is_cancelled) {
     // Look up the canonical name from Hardware so the reply matches what
     // the worker reported in WorkerRegister.
     const Device* dev_info = nullptr;
@@ -381,12 +398,17 @@ std::expected<BenchResult, BenchError> bench_one(const Hardware& hardware,
                                           "device not in ggml backend registry: " + device_id});
     }
 
+    // Checked before the first backend init: a benchmark queued behind one
+    // that outlived its stream must not allocate a 256 MB device buffer only
+    // to throw the result away.
+    if (cancelled(is_cancelled)) return cancel_error("bench");
+
     spdlog::info("benchmark start: {} ({})", dev_info->id, dev_info->name);
-    const auto memory = bench_bandwidth(dev);
+    const auto memory = bench_bandwidth(dev, is_cancelled);
     if (!memory) return std::unexpected(memory.error());
-    const auto compute = bench_q4k_matvec(dev);
+    const auto compute = bench_q4k_matvec(dev, is_cancelled);
     if (!compute) return std::unexpected(compute.error());
-    const auto load = bench_load_bandwidth(dev);
+    const auto load = bench_load_bandwidth(dev, is_cancelled);
     if (!load) return std::unexpected(load.error());
 
     BenchResult r{
