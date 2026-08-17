@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ggml-alloc.h"
@@ -19,6 +21,28 @@
 namespace mass_worker {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+// Wall-clock budget for each of the three phases (memory bandwidth, Q4_K
+// compute, host→device load). Without one the iteration counts below decide
+// the runtime, and they are sized for a discrete GPU: on an integrated
+// Radeon the compute phase alone ran ~30 s, long past the point where MASS
+// stops waiting for the reply. Every timed loop stops at its deadline, so a
+// device benchmark costs roughly the same seconds everywhere: three phases
+// bounded at kPhaseBudget + kWarmupBudget each, plus one-off setup.
+constexpr auto kPhaseBudget = std::chrono::seconds(2);
+
+// Slice of a phase the warm-up may spend before the first sample is taken.
+constexpr auto kWarmupBudget = std::chrono::milliseconds(300);
+
+// A short sample count is still a real measurement, just a noisier one —
+// say so rather than reporting the median as if every sample ran.
+void log_if_truncated(const char* phase, std::size_t got, int want) {
+    if (std::cmp_less(got, want)) {
+        spdlog::warn("bench {}: wall-clock budget hit after {}/{} samples", phase, got, want);
+    }
+}
 
 // RAII wrappers for the C handles. Define-at-call-site is fine — these don't
 // escape function scope.
@@ -134,23 +158,27 @@ std::expected<double, BenchError> bench_bandwidth(ggml_backend_dev_t dev) {
     ggml_backend_synchronize(backend.get());
 
     // Warm up.
-    for (int i = 0; i < 5; ++i) {
+    const auto warm_end = Clock::now() + kWarmupBudget;
+    for (int i = 0; i < 5 && Clock::now() < warm_end; ++i) {
         ggml_backend_graph_compute(backend.get(), graph);
         ggml_backend_synchronize(backend.get());
     }
 
     constexpr int kIters = 21;
     const double bytes_per_iter = 3.0 * static_cast<double>(tensor_bytes);
+    const auto deadline = Clock::now() + kPhaseBudget;
     std::vector<double> samples;
     samples.reserve(kIters);
     for (int i = 0; i < kIters; ++i) {
-        const auto t0 = std::chrono::high_resolution_clock::now();
+        const auto t0 = Clock::now();
         ggml_backend_graph_compute(backend.get(), graph);
         ggml_backend_synchronize(backend.get());
-        const auto t1 = std::chrono::high_resolution_clock::now();
+        const auto t1 = Clock::now();
         const double secs = std::chrono::duration<double>(t1 - t0).count();
         samples.push_back(secs > 0 ? bytes_per_iter / secs / 1e9 : 0);
+        if (t1 >= deadline) break;
     }
+    log_if_truncated("bandwidth", samples.size(), kIters);
     return median(std::move(samples));
 }
 
@@ -195,22 +223,26 @@ std::expected<double, BenchError> bench_load_bandwidth(ggml_backend_dev_t dev) {
     std::vector<float> src(static_cast<std::size_t>(kNElements), 1.0f);
 
     // Warm up to take page-fault / first-touch costs out of the measurement.
-    for (int i = 0; i < 3; ++i) {
+    const auto warm_end = Clock::now() + kWarmupBudget;
+    for (int i = 0; i < 3 && Clock::now() < warm_end; ++i) {
         ggml_backend_tensor_set(a, src.data(), 0, tensor_bytes);
         ggml_backend_synchronize(backend.get());
     }
 
     constexpr int kIters = 21;
+    const auto deadline = Clock::now() + kPhaseBudget;
     std::vector<double> samples;
     samples.reserve(kIters);
     for (int i = 0; i < kIters; ++i) {
-        const auto t0 = std::chrono::high_resolution_clock::now();
+        const auto t0 = Clock::now();
         ggml_backend_tensor_set(a, src.data(), 0, tensor_bytes);
         ggml_backend_synchronize(backend.get());
-        const auto t1 = std::chrono::high_resolution_clock::now();
+        const auto t1 = Clock::now();
         const double secs = std::chrono::duration<double>(t1 - t0).count();
         samples.push_back(secs > 0 ? static_cast<double>(tensor_bytes) / secs / 1e9 : 0);
+        if (t1 >= deadline) break;
     }
+    log_if_truncated("load", samples.size(), kIters);
     return median(std::move(samples));
 }
 
@@ -277,29 +309,51 @@ std::expected<double, BenchError> bench_q4k_matvec(ggml_backend_dev_t dev) {
     }
     ggml_backend_synchronize(backend.get());
 
-    // Warm to thermal steady state.
+    // Warm to thermal steady state, bounded: 20 graphs cost 2.7 s on a slow
+    // iGPU, before a single sample is taken. The last warm-up graph also
+    // sizes the sample batch below.
+    const auto warm_end = Clock::now() + kWarmupBudget;
+    double graph_secs = 0;
     for (int i = 0; i < 20; ++i) {
+        const auto t0 = Clock::now();
         ggml_backend_graph_compute(backend.get(), graph);
         ggml_backend_synchronize(backend.get());
+        const auto t1 = Clock::now();
+        graph_secs = std::chrono::duration<double>(t1 - t0).count();
+        if (t1 >= warm_end) break;
     }
 
-    constexpr int kRepsPerSample = 10;
+    // A sample times a batch of graphs so timer and sync overhead stay noise
+    // next to the work. Sizing that batch from the warm-up rather than fixing
+    // it at 10 keeps a sample's DURATION device-independent: at a fixed 10,
+    // one sample costs 20 ms on a discrete GPU and 1.3 s on an iGPU, and the
+    // slow device runs out of budget after two samples instead of taking the
+    // full set.
+    constexpr double kSampleTargetSecs = 0.06;
+    constexpr int kMaxRepsPerSample = 10;
+    const int reps = graph_secs > 0 ? std::clamp(static_cast<int>(kSampleTargetSecs / graph_secs),
+                                                 1, kMaxRepsPerSample)
+                                    : kMaxRepsPerSample;
+
     constexpr int kNSamples = 21;
     const double flops_per_graph = static_cast<double>(kNLayers) * 2.0 * kM * kK * kN;
-    const double total_flops = flops_per_graph * kRepsPerSample;
+    const double flops_per_sample = flops_per_graph * reps;
+    const auto deadline = Clock::now() + kPhaseBudget;
 
     std::vector<double> samples;
     samples.reserve(kNSamples);
     for (int i = 0; i < kNSamples; ++i) {
-        const auto t0 = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < kRepsPerSample; ++r) {
+        const auto t0 = Clock::now();
+        for (int r = 0; r < reps; ++r) {
             ggml_backend_graph_compute(backend.get(), graph);
         }
         ggml_backend_synchronize(backend.get());
-        const auto t1 = std::chrono::high_resolution_clock::now();
+        const auto t1 = Clock::now();
         const double secs = std::chrono::duration<double>(t1 - t0).count();
-        samples.push_back(secs > 0 ? total_flops / secs / 1e9 : 0);  // GFLOPS
+        samples.push_back(secs > 0 ? flops_per_sample / secs / 1e9 : 0);  // GFLOPS
+        if (t1 >= deadline) break;
     }
+    log_if_truncated("compute", samples.size(), kNSamples);
     return median(std::move(samples));
 }
 

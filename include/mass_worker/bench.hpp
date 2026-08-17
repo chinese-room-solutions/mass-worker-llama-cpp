@@ -35,6 +35,10 @@ class Hardware;
 // Run a single device's benchmark. Resolves the device by canonical ID
 // ("cpu:0" or "gpu:N"). Callers benching several devices run this per device
 // and report partial results — one failing device must not discard the rest.
+//
+// Bounded in wall clock: each phase samples until its deadline, so a device
+// an order of magnitude slower than a discrete GPU costs the same seconds and
+// only its sample count shrinks (logged when it does).
 [[nodiscard]] std::expected<BenchResult, BenchError> bench_one(const Hardware& hardware,
                                                                const std::string& device_id);
 
