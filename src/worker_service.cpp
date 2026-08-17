@@ -659,11 +659,11 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::run_job(
             // function between sampler steps. The set is shared
             // across all execute() calls, keyed by job_id, so
             // multiple in-flight jobs each see only their own
-            // cancel signal. A worker-wide stop cancels everything,
-            // and a failed streaming write cancels this job.
+            // cancel signal. A worker-wide stop or a closed control
+            // stream cancels everything, and a failed streaming write
+            // cancels this job.
             auto is_cancelled = [this, &job_id, &emit_failed]() {
-                return stopping_.load(std::memory_order_acquire) || emit_failed ||
-                       is_job_cancel_requested(job_id);
+                return abandoned() || emit_failed || is_job_cancel_requested(job_id);
             };
             auto result = chat->chat_completion_stream(parts->messages, parts->sampling, on_token,
                                                        is_cancelled);
@@ -698,7 +698,7 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::run_job(
         case lcpp::JOB_KIND_EMBED: {
             if (!embed) return terminal_error(job_id, "Embed: not an embedding model");
             auto is_cancelled = [this, &job_id]() {
-                return stopping_.load(std::memory_order_acquire) || is_job_cancel_requested(job_id);
+                return abandoned() || is_job_cancel_requested(job_id);
             };
             auto vec = embed->embed(decoded.embed().input(), is_cancelled);
             clear_job_cancel(job_id);
@@ -732,8 +732,8 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::run_job(
                     std::stop_token batch_abort) -> std::expected<std::vector<float>, std::string> {
                 ActiveGuard item_guard(active_mu_, active_per_model_, active_total_, model_id);
                 auto is_cancelled = [&]() {
-                    return stopping_.load(std::memory_order_acquire) ||
-                           batch_abort.stop_requested() || is_job_cancel_requested(job_id);
+                    return abandoned() || batch_abort.stop_requested() ||
+                           is_job_cancel_requested(job_id);
                 };
                 auto vec = embed->embed(inputs[static_cast<int>(i)], is_cancelled);
                 if (!vec) return std::unexpected(vec.error().message);
@@ -784,8 +784,8 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::run_job(
                 if (!parts) return std::unexpected(parts.error());
                 ActiveGuard item_guard(active_mu_, active_per_model_, active_total_, model_id);
                 auto is_cancelled = [&]() {
-                    return stopping_.load(std::memory_order_acquire) ||
-                           batch_abort.stop_requested() || is_job_cancel_requested(job_id);
+                    return abandoned() || batch_abort.stop_requested() ||
+                           is_job_cancel_requested(job_id);
                 };
                 auto result = chat->chat_completion_stream(parts->messages, parts->sampling,
                                                            /*on_token=*/{}, is_cancelled);

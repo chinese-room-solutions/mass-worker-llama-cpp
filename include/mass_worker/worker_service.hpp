@@ -184,10 +184,14 @@ public:
 
     // Control-stream lifecycle, driven by the runner: begin_session() when a
     // stream is serving, end_session() the moment it closes. Work whose only
-    // consumer is that stream — a device benchmark, tens of seconds long and
-    // uncancellable otherwise — polls the flag and aborts, instead of running
-    // to completion to produce a frame nothing can receive. Jobs keep their
-    // own per-job cancellation; this is the session-wide edge.
+    // consumer is that stream — a device benchmark, a multi-GB fetch, a
+    // generation running to max_tokens — polls the flag and aborts, instead
+    // of running to completion to produce a frame nothing can receive.
+    //
+    // Abandoning an in-flight job loses nothing: MASS reaps the disconnected
+    // worker's queue back to global (drainWorkerQueue, includeLeased) and
+    // re-dispatches the job on a surviving worker, so the tokens burned after
+    // the stream died are duplicated work either way.
     void begin_session();
     void end_session();
 
