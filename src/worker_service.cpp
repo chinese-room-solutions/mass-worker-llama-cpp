@@ -893,16 +893,25 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
             }
 
             // Fetch files via the Phase 4 fetcher (loopback / sha256 / retry).
-            // Cancellable by worker shutdown AND by a CancelJob carrying this
-            // load's job_id — a multi-GB download must not be immortal.
+            // Cancellable by worker shutdown, by the control stream closing,
+            // AND by a CancelJob carrying this load's job_id — a multi-GB
+            // download must not be immortal. Partial bytes survive in the
+            // ".downloading" sibling, so the load MASS re-issues on reconnect
+            // resumes rather than starting over.
             std::vector<ModelFile> files;
             for (const auto& f : req.files()) files.push_back(to_fetch_file(f));
             auto fetch_cancelled = [this, &job_id]() {
-                return fetch_cancel_.load(std::memory_order_acquire) ||
-                       is_job_cancel_requested(job_id);
+                return abandoned() || is_job_cancel_requested(job_id);
             };
             auto fetched = fetcher_.fetch_all(files, fetch_cancelled);
             clear_job_cancel(job_id);  // the fetch is the load's only cancellable phase
+            // Checked before the failure branch: an abandoned fetch's error
+            // frame is unsendable, and the load itself — minutes of disk and
+            // VRAM — has nobody left to report a pool size to.
+            if (abandoned()) {
+                spdlog::info("load abandoned: no live stream job_id={} model_id={}", job_id, mid);
+                return nullptr;
+            }
             if (!fetched) {
                 return load_error(job_id, mid, "LoadModel: " + fetched.error().message);
             }
@@ -1043,10 +1052,7 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
             // consumer: the control stream that asked for it. Once that stream
             // is gone (or the worker is stopping) the remaining phases can only
             // produce an unsendable frame, so abort at the next poll.
-            auto abandoned = [this]() {
-                return stopping_.load(std::memory_order_acquire) ||
-                       !session_open_.load(std::memory_order_acquire);
-            };
+            auto is_abandoned = [this]() { return abandoned(); };
 
             // Per-device isolation: one failing device must not discard the
             // devices that already measured — the reply carries the partial
@@ -1055,7 +1061,7 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::execute_impl(const pb::HubMess
             std::vector<std::string> errors;
             auto run_device = [&](const std::string& id) {
                 try {
-                    if (auto r = bench_one(hardware_, id, abandoned); r) {
+                    if (auto r = bench_one(hardware_, id, is_abandoned); r) {
                         results.push_back(std::move(*r));
                     } else {
                         errors.push_back(id + ": " + r.error().message);
@@ -1148,8 +1154,16 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::run_model_benchmark(
     // leave only via HubDeleteCacheFiles.
     std::vector<ModelFile> files;
     for (const auto& f : req.files()) files.push_back(to_fetch_file(f));
-    auto fetch_cancelled = [this]() { return fetch_cancel_.load(std::memory_order_acquire); };
-    auto fetched = fetcher_.fetch_all(files, fetch_cancelled);
+    auto fetched = fetcher_.fetch_all(files, [this]() { return abandoned(); });
+    // A model benchmark is the longest single unit of work a worker does — a
+    // multi-GB fetch, a full load, then a probe — and its only consumer is the
+    // control stream that asked for it. Bail the moment that stream is gone;
+    // MASS leaves no row on a missing reply and re-issues the bench on
+    // reconnect, and the fetch's partial bytes stay on disk to resume from.
+    if (abandoned()) {
+        spdlog::info("model benchmark abandoned: no live stream model_id={}", mid);
+        return nullptr;
+    }
     if (!fetched) {
         return bench_failure(mid, pb::MODEL_BENCHMARK_FAILURE_KIND_TRANSIENT,
                              "ModelBenchmark: " + fetched.error().message);
@@ -1197,6 +1211,13 @@ std::unique_ptr<pb::WorkerMessage> WorkerService::run_model_benchmark(
     auto result = run_job(chat, embed, mid, job_id, req.payload(), drop);
     const double elapsed_secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // Second poll: the load and the payload run between the first one and
+    // here, and returning unloads the model instead of probing a measurement
+    // nothing will read.
+    if (abandoned()) {
+        spdlog::info("model benchmark abandoned: no live stream model_id={}", mid);
+        return nullptr;
+    }
     if (!result || result->job_result().has_error()) {
         const std::string msg = result ? result->job_result().error().message()
                                        : std::string("payload produced no terminal frame");
@@ -1309,7 +1330,6 @@ WorkerService::AllowedDevices WorkerService::allowed_load_devices() const {
 
 void WorkerService::request_stop() {
     stopping_.store(true, std::memory_order_release);
-    fetch_cancel_.store(true, std::memory_order_release);
 }
 
 void WorkerService::begin_session() {

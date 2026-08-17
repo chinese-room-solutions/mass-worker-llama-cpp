@@ -189,4 +189,53 @@ TEST(RegistrationTest, ReportsEffectiveVramHeadroom) {
         << "register frame carries " << reg->protocol_versions_size() << " protocol version(s)";
 }
 
+std::string session_models_dir() {
+    const auto dir = std::filesystem::temp_directory_path() / "mass-worker-session-test-models";
+    std::filesystem::create_directories(dir);
+    return dir.string();
+}
+
+// Control-thread work exists only to answer the stream that asked for it, so
+// a closed session must stop it at the next poll instead of after its full
+// run. Both messages are driven with no files: the fetch fails immediately, so
+// an open session answers with a frame naming that failure (which pins the
+// path past device placement), and a closed one answers with nothing at all.
+class SessionTeardownTest : public ::testing::Test {
+protected:
+    SessionTeardownTest() : svc_("worker-1", "bench-box", session_models_dir()) {}
+
+    static bool drop(const mass::v1::worker::WorkerMessage&) { return true; }
+
+    WorkerService svc_;
+};
+
+TEST_F(SessionTeardownTest, ModelBenchmarkStopsWhenTheStreamIsGone) {
+    mass::v1::worker::HubMessage msg;
+    msg.mutable_model_benchmark()->set_model_id("m1");
+
+    const auto served = svc_.execute(msg, drop);
+    ASSERT_NE(served, nullptr);
+    EXPECT_NE(served->model_benchmark().failure().message().find("no model files provided"),
+              std::string::npos)
+        << served->model_benchmark().failure().message();
+
+    svc_.end_session();
+    EXPECT_EQ(svc_.execute(msg, drop), nullptr);
+}
+
+TEST_F(SessionTeardownTest, LoadModelStopsWhenTheStreamIsGone) {
+    mass::v1::worker::HubMessage msg;
+    auto* lm = msg.mutable_load_model();
+    lm->set_job_id("j1");
+    lm->set_model_id("m1");
+
+    const auto served = svc_.execute(msg, drop);
+    ASSERT_NE(served, nullptr);
+    EXPECT_NE(served->load_model().error().find("no model files provided"), std::string::npos)
+        << served->load_model().error();
+
+    svc_.end_session();
+    EXPECT_EQ(svc_.execute(msg, drop), nullptr);
+}
+
 }  // namespace

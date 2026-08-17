@@ -139,8 +139,10 @@ public:
     // call: WorkerJobResult (chat/embed/tokenize), WorkerLoadModelResult,
     // or WorkerUnloadResult. nullptr means "no terminal frame": the
     // fire-and-forget messages (CancelJob, DeleteCacheFiles,
-    // SetEnabledDevices) and malformed HubMessages with no msg case,
-    // which carry no job_id a frame could be routed by (logged + dropped).
+    // SetEnabledDevices), malformed HubMessages with no msg case, which
+    // carry no job_id a frame could be routed by (logged + dropped), and
+    // work abandoned mid-flight because its control stream closed (see
+    // end_session) — there is no longer anything to send a frame to.
     //
     // Never throws: llama/ggml raise runtime failures (device OOM during
     // a load or decode) as C++ exceptions, and execute runs on worker
@@ -258,8 +260,6 @@ private:
     mutable std::shared_mutex enabled_mu_;
     std::optional<std::unordered_set<std::string>> enabled_devices_;
 
-    std::atomic<bool> fetch_cancel_{false};
-
     // Set by request_stop()/shutdown(). ORed into every job's IsCancelledFn
     // so a worker stop cancels in-flight generation instead of letting it
     // run to max_tokens.
@@ -268,6 +268,16 @@ private:
     // Set/cleared by begin_session()/end_session(). Starts open so a service
     // driven without a runner (tests, tools) behaves as if it had a consumer.
     std::atomic<bool> session_open_{true};
+
+    // abandoned() means "nothing can receive this work's result any more":
+    // the process is stopping, or the control stream that asked for it is
+    // gone. Every long-running poll (fetch, device benchmark, generation)
+    // ORs it in, so work outlives its consumer by one poll interval instead
+    // of by its full run.
+    [[nodiscard]] bool abandoned() const noexcept {
+        return stopping_.load(std::memory_order_acquire) ||
+               !session_open_.load(std::memory_order_acquire);
+    }
 
     // Per-job cancellation requests from MASS via HubCancelJob, keyed by
     // job_id with the arrival time. chat_completion_stream polls
